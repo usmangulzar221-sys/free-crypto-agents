@@ -1,376 +1,414 @@
-import streamlit as st
-import requests
-import pandas as pd
-import yfinance as yf
+import streamlit as st, requests, pandas as pd, numpy as np
 import plotly.graph_objects as go
-import random
+from plotly.subplots import make_subplots
 from datetime import datetime
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="FULL SCANNER - 51 Features", layout="wide", page_icon="🚀")
+st.set_page_config(page_title="Crypto Agent Scanner", page_icon="🚀", layout="wide")
 
 st.markdown("""
 <style>
-.stApp{background:#070a12;color:white}
-.card{background:#111827;border-radius:14px;padding:12px;border:1px solid #1f2937;margin-bottom:10px}
+.stApp{background:#0b0f17;color:#e5e7eb}
+.card{background:#111827;border-radius:12px;padding:14px;border:1px solid #1f2937;margin:8px 0}
+.buy{color:#22c55e;font-weight:800}
+.sell{color:#ef4444;font-weight:800}
+.hold{color:#f59e0b;font-weight:800}
+.agent{background:#0f172a;border-radius:10px;padding:10px;margin:6px 0;border-left:4px solid #3b82f6}
+.bar{height:8px;border-radius:4px;background:#1f2937;overflow:hidden}
+.bar>div{height:100%}
 </style>
 """, unsafe_allow_html=True)
 
+API = "https://api.binance.com/api/v3"
+COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
+         "ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","LTCUSDT","BCHUSDT",
+         "UNIUSDT","SUIUSDT","TRXUSDT","APTUSDT","ATOMUSDT","NEARUSDT",
+         "INJUSDT","MATICUSDT","SHIBUSDT","PEPEUSDT","OPUSDT","ARBUSDT","TIAUSDT"]
 
-def get_real(sym):
+
+@st.cache_data(ttl=20)
+def kl(sym, itv="1h", lim=300):
     try:
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", timeout=3)
-        p = float(r.json()['price'])
-        if 0 < p < 2000000:
-            return p, "Binance ✅"
+        r = requests.get(f"{API}/klines",
+                         params={"symbol": sym, "interval": itv, "limit": lim},
+                         timeout=8)
+        d = r.json()
+        if not isinstance(d, list) or len(d) == 0:
+            return pd.DataFrame()
+        df = pd.DataFrame(d, columns=["t","o","h","l","c","v","ct","qv","n","tb","tq","ig"])
+        for col in ["o","h","l","c","v","qv"]:
+            df[col] = df[col].astype(float)
+        df["t"] = pd.to_datetime(df["t"], unit="ms")
+        return df
     except Exception:
-        pass
-    backup = {"BTC":83830,"ETH":2450,"SOL":110,"BNB":749,"XRP":1.3953,"DOGE":0.0853,
-              "ADA":0.2724,"AVAX":10.35,"LINK":11.72,"DOT":1.19,"LTC":63.99,"BCH":278.20,
-              "UNI":7.45,"SUI":1.10,"TRX":0.3304,"APT":0.8595,"ATOM":1.95,"IMX":0.194,
-              "OP":0.098,"RNDR":1.70,"STX":0.401,"PEPE":0.0000045,"XLM":0.1924,
-              "MATIC":0.539,"NEAR":5.294,"INJ":7.78,"SHIB":0.00000545}
-    return backup.get(sym, 100.0), "Backup ✅"
+        return pd.DataFrame()
 
 
-def get_trend():
-    dxy = 103.5
-    btc_d = 58.2
-    t = "BEARISH" if dxy > 103 and btc_d > 57 else "BULLISH"
-    b = "SHORT" if t == "BEARISH" else "LONG"
-    bs = 28.5 if t == "BEARISH" else 71.5
-    return t, b, dxy, btc_d, bs
+@st.cache_data(ttl=10)
+def price(sym):
+    try:
+        r = requests.get(f"{API}/ticker/price", params={"symbol": sym}, timeout=5)
+        return float(r.json()["price"])
+    except Exception:
+        return None
 
 
-def sl_prob_calc(entry, sl, sup, res, atr, vol, fr, side):
-    p = 0
-    if side == "LONG" and abs(sl - sup) / entry * 100 < 0.3:
-        p += 40
-    if side == "SHORT" and abs(sl - res) / entry * 100 < 0.3:
-        p += 40
-    if atr > 2.0:
-        p += 20
-    if vol < 1.0:
-        p += 15
-    if abs(fr) > 0.01:
-        p += 15
-    p += random.randint(0, 10)
-    return min(p, 95)
+@st.cache_data(ttl=10)
+def tick24(sym):
+    try:
+        r = requests.get(f"{API}/ticker/24hr", params={"symbol": sym}, timeout=6)
+        return r.json()
+    except Exception:
+        return {}
 
 
-mt, mb, dxy, btc_d, bs = get_trend()
-btc_p, btc_s = get_real("BTC")
+def ind(df):
+    df = df.copy()
+    df["ema20"] = df["c"].ewm(span=20).mean()
+    df["ema50"] = df["c"].ewm(span=50).mean()
+    d = df["c"].diff()
+    g = d.clip(lower=0).rolling(14).mean()
+    l = (-d.clip(upper=0)).rolling(14).mean()
+    df["rsi"] = 100 - 100 / (1 + g / l.replace(0, np.nan))
+    tr = pd.concat([df["h"]-df["l"],
+                    (df["h"]-df["c"].shift()).abs(),
+                    (df["l"]-df["c"].shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+    df["vavg"] = df["v"].rolling(20).mean()
+    df["vr"] = df["v"] / df["vavg"]
+    return df
 
-st.title(f"🚀 FULL SCANNER - ${btc_p:,.0f} - 51 Features")
-st.markdown(
-    f"<div class='card'><b>BTC:</b> ${btc_p:.2f} {btc_s} | "
-    f"<b>Market:</b> {mt} Bias {mb} {bs}% | DXY {dxy} BTC.D {btc_d}% | "
-    f"<b>46 Agents</b> | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
-    unsafe_allow_html=True
-)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 CHART (7-18)", "🔴 RADAR (19-33)", "🤖 AGENTS (37-40)",
-    "🔔 SCANNER (41-49)", "📈 BACKTEST (51)", "✅ ACCURACY (50)"
+def zones(df, lb=5):
+    H = df["h"].values; L = df["l"].values; T = df["t"].values
+    res = []; sup = []
+    for i in range(lb, len(df) - lb):
+        if H[i] == max(H[i-lb:i+lb+1]): res.append((T[i], H[i]))
+        if L[i] == min(L[i-lb:i+lb+1]): sup.append((T[i], L[i]))
+    return sup[-3:], res[-3:]
+
+
+def signals(df):
+    out = []
+    for i in range(1, len(df)):
+        pf, ps = df["ema20"].iloc[i-1], df["ema50"].iloc[i-1]
+        cf, cs = df["ema20"].iloc[i], df["ema50"].iloc[i]
+        r = df["rsi"].iloc[i]
+        if pd.isna(pf) or pd.isna(r):
+            continue
+        if pf <= ps and cf > cs and r < 70:
+            out.append({"i":i,"time":df["t"].iloc[i],"price":df["c"].iloc[i],"type":"BUY","rsi":r})
+        elif pf >= ps and cf < cs and r > 30:
+            out.append({"i":i,"time":df["t"].iloc[i],"price":df["c"].iloc[i],"type":"SELL","rsi":r})
+    return out
+
+
+def track(df, s):
+    i = s["i"]; e = s["price"]
+    fut = df.iloc[i+1:]
+    if fut.empty:
+        return {"up":0.0,"down":0.0,"cur":e,"hrs":0.0,"live":True}
+    cur = df["c"].iloc[-1]
+    hrs = (df["t"].iloc[-1] - df["t"].iloc[i]).total_seconds() / 3600
+    return {"up":(fut["h"].max()-e)/e*100,
+            "down":(fut["l"].min()-e)/e*100,
+            "cur":cur, "hrs":hrs, "live":False}
+
+
+# ============ HEADER ============
+btc_p = price("BTCUSDT")
+if btc_p:
+    st.title(f"🚀 Crypto Agent Scanner — BTC ${btc_p:,.2f}")
+else:
+    st.title("🚀 Crypto Agent Scanner")
+st.caption(f"Live Binance data • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📈 Chart + Zones",
+    "📡 Signals (Time + Move)",
+    "🤖 Agents Discussion",
+    "🔔 Scanner + Volume Alerts"
 ])
 
-# ================= TAB 1 =================
+# ============ TAB 1 : CHART ============
 with tab1:
-    st.markdown("### 7-18: Chart + S/R + Buy/Sell + OB + FVG")
-    coin = st.selectbox("Coin", ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD",
-                                  "DOGE-USD","ADA-USD","AVAX-USD","LINK-USD"], index=0)
-    df = pd.DataFrame()
-    try:
-        df = yf.download(coin, period="5d", interval="1h", progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
-    except Exception:
-        pass
+    c1, c2 = st.columns([1, 1])
+    sym = c1.selectbox("Coin", COINS, index=0)
+    itv = c2.selectbox("Timeframe", ["15m","1h","4h","1d"], index=1)
 
-    if not df.empty and len(df) > 20:
-        sup = float(df['Low'].rolling(20).min().iloc[-1])
-        res = float(df['High'].rolling(20).max().iloc[-1])
-        ema_f = df['Close'].ewm(span=20).mean()
-        ema_s = df['Close'].ewm(span=50).mean()
-        last = float(df['Close'].iloc[-1])
+    df = kl(sym, itv, 300)
+    if df.empty:
+        st.error("Binance se data nahi mila. Network check karo.")
+    else:
+        df = ind(df)
+        sup, res = zones(df)
+        sigs = signals(df)
+        last = df.iloc[-1]
 
-        buy_x, buy_y, sell_x, sell_y = [], [], [], []
-        for i in range(1, len(df)):
-            try:
-                if float(ema_f.iloc[i-1]) <= float(ema_s.iloc[i-1]) and float(ema_f.iloc[i]) > float(ema_s.iloc[i]):
-                    buy_x.append(df.index[i]); buy_y.append(float(df['Close'].iloc[i]))
-                if float(ema_f.iloc[i-1]) >= float(ema_s.iloc[i-1]) and float(ema_f.iloc[i]) < float(ema_s.iloc[i]):
-                    sell_x.append(df.index[i]); sell_y.append(float(df['Close'].iloc[i]))
-            except Exception:
-                continue
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.03,
+                            row_heights=[0.6, 0.18, 0.22],
+                            subplot_titles=("", "Volume", "RSI"))
 
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
-                                     low=df['Low'], close=df['Close'], name="Candle"))
-        fig.add_trace(go.Scatter(x=df.index, y=ema_f, line=dict(color="#00e5ff", width=1.5), name="EMA 20"))
-        fig.add_trace(go.Scatter(x=df.index, y=ema_s, line=dict(color="yellow", width=1.5), name="SuperTrend"))
-        fig.add_hline(y=sup, line_dash="dash", line_color="#00ff88", annotation_text=f"SUP ${sup:.0f}")
-        fig.add_hline(y=res, line_dash="dash", line_color="#ff2d78", annotation_text=f"RES ${res:.0f}")
-        if buy_x:
-            fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode="markers",
-                                     marker=dict(color="#00ff88", size=14, symbol="triangle-up"), name="BUY"))
-        if sell_x:
-            fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode="markers",
-                                     marker=dict(color="#ff2d78", size=14, symbol="triangle-down"), name="SELL"))
-        fig.update_layout(template="plotly_dark", height=550,
-                          paper_bgcolor="#070a12", plot_bgcolor="#070a12",
-                          xaxis_rangeslider_visible=False,
-                          title=f"{coin} - S/R + Buy/Sell Triangles")
+        fig.add_trace(go.Candlestick(
+            x=df["t"], open=df["o"], high=df["h"], low=df["l"], close=df["c"],
+            name=sym, increasing_line_color="#22c55e",
+            decreasing_line_color="#ef4444"), row=1, col=1)
+
+        fig.add_trace(go.Scatter(x=df["t"], y=df["ema20"],
+            line=dict(color="#22d3ee", width=1.5), name="EMA20"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["ema50"],
+            line=dict(color="#fbbf24", width=1.5), name="EMA50"), row=1, col=1)
+
+        # Resistance zones (red)
+        for t, p in res:
+            fig.add_hrect(y0=p*0.998, y1=p*1.002, fillcolor="#ef4444",
+                          opacity=0.15, line_width=0, row=1, col=1)
+            fig.add_hline(y=p, line_dash="dash", line_color="#ef4444",
+                          annotation_text=f"RES ${p:,.2f}", row=1, col=1)
+        # Support zones (green)
+        for t, p in sup:
+            fig.add_hrect(y0=p*0.998, y1=p*1.002, fillcolor="#22c55e",
+                          opacity=0.15, line_width=0, row=1, col=1)
+            fig.add_hline(y=p, line_dash="dash", line_color="#22c55e",
+                          annotation_text=f"SUP ${p:,.2f}", row=1, col=1)
+
+        # Buy/Sell triangles
+        for s in sigs:
+            col = "#22c55e" if s["type"] == "BUY" else "#ef4444"
+            fig.add_trace(go.Scatter(
+                x=[s["time"]], y=[s["price"]*0.998 if s["type"]=="BUY" else s["price"]*1.002],
+                mode="markers+text",
+                marker=dict(symbol="triangle-up" if s["type"]=="BUY" else "triangle-down",
+                            size=16, color=col),
+                text=[s["type"]], textposition="bottom center",
+                textfont=dict(color=col, size=10),
+                showlegend=False, hovertext=f"{s['type']} @ ${s['price']:,.4f}<br>RSI {s['rsi']:.1f}"),
+                row=1, col=1)
+
+        # Volume with color
+        vc = ["#22c55e" if c >= o else "#ef4444" for c, o in zip(df["c"], df["o"])]
+        fig.add_trace(go.Bar(x=df["t"], y=df["v"], marker_color=vc, name="Vol"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["vavg"],
+            line=dict(color="#fbbf24", width=1), name="Vol Avg"), row=2, col=1)
+
+        # RSI
+        fig.add_trace(go.Scatter(x=df["t"], y=df["rsi"],
+            line=dict(color="#a78bfa", width=1.5), name="RSI"), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", row=3, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", row=3, col=1)
+
+        fig.update_layout(
+            template="plotly_dark", height=750,
+            paper_bgcolor="#0b0f17", plot_bgcolor="#0b0f17",
+            xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", y=1.02),
+            margin=dict(l=10, r=10, t=40, b=10),
+            title=f"{sym} — {itv} • TradingView-style Zones + Signals")
         st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown(
-            f"<div class='card' style='border:2px solid #00ff88'>"
-            f"<b>Entry:</b> ${last:.0f} <b>SL:</b> ${last*0.997:.0f} "
-            f"<b>TP1:</b> ${last*1.004:.0f} <b>TP2:</b> ${last*1.01:.0f} <b>TP3:</b> ${last*1.025:.0f} RR 10.5 | "
-            f"<b>Support:</b> ${sup:.0f} | <b>Resistance:</b> ${res:.0f} | "
-            f"<b>FVG:</b> ${last*0.999:.0f}-${last*1.001:.0f} | "
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
-            unsafe_allow_html=True
-        )
-    else:
-        st.warning("Yahoo data unavailable - backup shown.")
-        st.markdown(
-            f"<div class='card'><b>BTC:</b> ${btc_p:.0f} | SL ${btc_p*0.997:.0f} | TP ${btc_p*1.01:.0f}</div>",
-            unsafe_allow_html=True
-        )
+        # Info strip
+        vr = float(last["vr"]) if not pd.isna(last["vr"]) else 0
+        tag = "🐳 VOLUME SPIKE" if vr > 1.5 else "Normal Volume"
+        rsi_col = "#ef4444" if last["rsi"] > 70 else "#22c55e" if last["rsi"] < 30 else "#f59e0b"
+        st.markdown(f"""
+        <div class='card'>
+        <b>Price:</b> ${last['c']:,.4f} | 
+        <b>EMA20:</b> ${last['ema20']:,.2f} | <b>EMA50:</b> ${last['ema50']:,.2f} |
+        <b>RSI:</b> <span style='color:{rsi_col}'>{last['rsi']:.1f}</span> |
+        <b>ATR:</b> ${last['atr']:.4f} |
+        <b>Vol:</b> {vr:.2f}x <span class='hold'>{tag}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-# ================= TAB 2 =================
+# ============ TAB 2 : SIGNALS ============
 with tab2:
-    st.markdown("### 19-33: LIVE RADAR")
-    html = f"""
-    <div class='card' style='border:2px solid #00ff88'>
-    <span style='font-size:26px;font-weight:900'>${btc_p:,.0f} {mb} Strength 85/100 ✅</span><br><br>
-    <b>Price:</b> Binance ${btc_p:.2f} | Diff 0.0$ ZERO ✅<br>
-    <b>19 OI:</b> $7.81B | <b>20 FR:</b> +0.0054% | <b>21 Spread:</b> $0.1<br>
-    <b>22 H/L:</b> ${btc_p+1000:.0f} / ${btc_p-1000:.0f} Vol $18.83B<br>
-    <b>23 Magnet:</b> $85,000 | <b>24 Target:</b> $82,600 Score 97<br>
-    <b>25 Sweep:</b> WEAK BULLISH 39/100 | <b>26 Trap:</b> 0/0 30/35<br>
-    <b>27 Spoof:</b> 98/100 | <b>28 CVD:</b> Delta -58070<br>
-    <b>29 OB Live:</b> Bids/Asks Live | <b>30 Heatmap:</b> $83,850 9.2 BTC WALL<br>
-    <b>31 POC:</b> Volume Profile | <b>32 Large:</b> APPEAR/CANCEL<br>
-    <b>33 DXY:</b> {dxy} BTC.D {btc_d}% | <b>OB:</b> Bull $83800 Bear $84000<br>
-    <b>FVG:</b> $83750-83850 | <b>ATR:</b> SL20 TP210 RR 10.5<br>
-    <b>Vol:</b> 1.83x WHALE 🐳 | <b>Bias:</b> {bs}% {mt}<br>
-    <b>H4/M15 ALIGNED ✅</b> | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
-# ================= TAB 3 =================
-with tab3:
-    st.markdown("### 37-40: 46 AGENTS")
-    agents = pd.DataFrame([
-        ["1A Binance","GPT-4o", f"${btc_p:.0f}", "✅"],
-        ["1B Bybit","Claude", f"${btc_p:.0f}", "✅"],
-        ["2A Mempool","Claude","ZERO","✅"],
-        ["2B Blockchain","GPT","$83830","✅"],
-        ["3A H4 60%","Confluence", mt,"✅"],
-        ["3B M15 40%","Timing","ALIGNED","✅"],
-        ["4A VSA","VSA","1.83x WHALE","🐳"],
-        ["4B Whale","VSA","Detected","🐳"],
-        ["5A OB Bull","SMC","$83,800","ACTIVE"],
-        ["5B OB Bear","SMC","$84,000","ACTIVE"],
-        ["6A FVG","FVG","$83,750-83,850","ACTIVE"],
-        ["6B Imbalance","FVG","ACTIVE","✅"],
-        ["7A DXY","Macro", f"{dxy}","BEARISH"],
-        ["7B BTC.D","Macro", f"{btc_d}%","✅"],
-        ["8A ATR SL","ATR","$20","✅"],
-        ["8B ATR TP","ATR","$210 RR 10.5","✅"],
-        ["9A High","HighLow","$61931","✅"],
-        ["9B Low","HighLow","$59060","✅"],
-        ["10A Sell Wall","Exchange","$78.6M","✅"],
-        ["10B Buy Wall","Exchange","$58.9M","✅"],
-        ["11A Candle","Graphic","TV 100%","✅"],
-        ["11B SuperTrend","Graphic","10,3","✅"],
-        ["12A Entry","Signal", f"${btc_p:.0f}","✅"],
-        ["12B RR","Signal","10.5","✅"],
-        ["13A Gecko","Search","Real","✅"],
-        ["13B CMC","Search","Real","✅"],
-        ["14A Magnet","Liquidity","$85k","✅"],
-        ["14B Target","Liquidity","$82.6k","✅"],
-        ["15A Bids","OB","Live","✅"],
-        ["15B Asks","OB","Live","✅"],
-        ["16A Heatmap","Heatmap","$83,850","✅"],
-        ["16B POC","VP","POC","✅"],
-        ["17A CVD Buy","CVD","4496514","✅"],
-        ["17B CVD Sell","CVD","4554584","✅"],
-        ["18A Spoof","Spoof","98/100","⚠️"],
-        ["18B Cancel","Spoof","0%","⚠️"],
-        ["19A FR","FR/OI","+0.0054%","✅"],
-        ["19B OI","OI","$7.81B","✅"],
-        ["20A Large Add","Large","APPEAR","✅"],
-        ["20B Large Del","Large","CANCEL","✅"],
-        ["21A Bias","Bias", f"{bs}%","✅"],
-        ["21B Strength","Strength","46","✅"],
-        ["22A Sweep","Sweep","39/100","✅"],
-        ["22B Trap","Trap","0/0","✅"],
-        ["23A Equity","Backtest","$24830","✅"],
-        ["23B WinRate","Master","85-90%","✅"],
-    ], columns=["Agent","LLM","Data","Status"])
-    st.dataframe(agents, use_container_width=True)
-
-# ================= TAB 4 =================
-with tab4:
-    st.markdown("### 41-49: ALL COINS + SL Protection + Close + Voice")
-
-    c1, c2, c3 = st.columns(3)
-    ms = c1.slider("Min Strength", 50, 90, 80)
-    tf = c2.selectbox("Timeframe", ["15M","1H","4H","H4+M15 Confluence"], index=3)
-    auto = c3.checkbox("🔄 Auto Scan", value=False)
-
-    ALL_COINS = ["BTC","ETH","SOL","BNB","XRP","DOGE","ADA","AVAX","LINK","DOT",
-                 "LTC","BCH","UNI","SUI","TRX","APT","ATOM","IMX","OP","RNDR",
-                 "STX","PEPE","XLM","MATIC","NEAR","INJ","SHIB"]
-
-    def scan_all():
-        out = []
-        for sym in ALL_COINS:
-            live, src = get_real(sym)
-            if live is None:
-                continue
-            vol = random.uniform(0.9, 2.4)
-            atr = random.uniform(0.6, 2.6)
-            fr = random.uniform(-0.005, 0.015)
-            side = mb
-            strength = 75 + random.randint(0, 20)
-            if vol > 1.5:
-                strength += 8
-            if strength > 95:
-                strength = 95
-            if strength < ms:
-                continue
-            sup = live * 0.98
-            resi = live * 1.02
-            entry = live
-            sl = live * (0.997 if side == "LONG" else 1.003)
-            tp1 = live * (1.004 if side == "LONG" else 0.996)
-            tp2 = live * (1.01 if side == "LONG" else 0.99)
-            tp3 = live * (1.025 if side == "LONG" else 0.975)
-            prob = sl_prob_calc(entry, sl, sup, resi, atr, vol, fr, side)
-            close = prob > 70
-            reason = ""
-            if prob > 70:
-                reason = f"SL Hit {prob}% HIGH - S/R paas"
-            out.append({
-                "Coin": sym, "Live": round(live, 4), "Side": side,
-                "Entry": round(entry, 4), "SL": round(sl, 4),
-                "TP1": round(tp1, 4), "TP2": round(tp2, 4), "TP3": round(tp3, 4),
-                "Strength": strength,
-                "Start": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "Trend": mt, "Bias": mb, "SLHit": f"{prob}%",
-                "Decision": "🔴 CLOSE NOW" if close else "🟢 HOLD",
-                "Reason": reason, "Sup": round(sup, 4), "Res": round(resi, 4),
-                "Vol": f"{vol:.2f}x", "ATR": f"{atr:.2f}", "FR": f"{fr:.4f}%",
-                "Agents": "8/12" if close else "12/12", "Source": src, "TF": tf
-            })
-        return out
-
-    if st.button("🚀 SCAN ALL COINS") or auto:
-        with st.spinner("Scanning..."):
-            data = scan_all()
-            if data:
-                df = pd.DataFrame(data).sort_values(by="Strength", ascending=False)
-                st.dataframe(df, use_container_width=True)
-                close_c = sum(1 for r in data if "CLOSE" in r['Decision'])
-                hold_c = len(data) - close_c
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Signals", len(data))
-                m2.metric("HOLD 🟢", hold_c)
-                m3.metric("CLOSE 🔴", close_c)
-                m4.metric(f"Market {mt}", mb, f"{bs}%")
-
-                for r in data:
-                    col = "#ff2d78" if "CLOSE" in r['Decision'] else "#00ff88"
-                    prob = int(r['SLHit'].replace('%',''))
-                    prob_col = "#ff2d78" if prob > 70 else "#facc15" if prob > 50 else "#00ff88"
-                    reason_html = f"<br><b>Reason:</b> {r['Reason']}" if r['Reason'] else ""
-                    st.markdown(
-                        f"<div class='card' style='border-left:6px solid {col}'>"
-                        f"<b>{r['Coin']} {r['Side']} Strength {r['Strength']}/100 {r['Start']} "
-                        f"{r['Trend']} {r['Bias']} TF {r['TF']}</b><br>"
-                        f"<b>Live:</b> ${r['Live']} <b>Entry:</b> ${r['Entry']} "
-                        f"<b>SL:</b> ${r['SL']} <b>TP1:</b> ${r['TP1']} "
-                        f"<b>TP2:</b> ${r['TP2']} <b>TP3:</b> ${r['TP3']}<br>"
-                        f"<b>Sup:</b> ${r['Sup']} <b>Res:</b> ${r['Res']} "
-                        f"<b>Vol:</b> {r['Vol']} <b>ATR:</b> {r['ATR']} <b>FR:</b> {r['FR']}<br>"
-                        f"<b>Agents:</b> {r['Agents']} | "
-                        f"<b>SL Hit:</b> <span style='color:{prob_col};font-weight:900'>{r['SLHit']}</span> | "
-                        f"<b>Decision:</b> <span style='font-size:18px;font-weight:900'>{r['Decision']}</span>"
-                        f"{reason_html} | <b>Src:</b> {r['Source']}</div>",
-                        unsafe_allow_html=True
-                    )
-                    if "CLOSE" in r['Decision']:
-                        st.toast(f"🔴 CLOSE {r['Coin']} {r['Side']} {r['SLHit']}", icon="🔴")
-                        voice = f"Close {r['Coin']} {r['Side']} SL hit {prob} percent"
-                        components.html(
-                            f"<script>var u=new SpeechSynthesisUtterance('{voice}');"
-                            f"window.speechSynthesis.speak(u);</script>",
-                            height=0
-                        )
-                    elif r['Strength'] >= 85:
-                        st.toast(f"🟢 HOLD {r['Coin']} {r['Side']} {r['Strength']}/100", icon="🟢")
-
-# ================= TAB 5 =================
-with tab5:
-    st.markdown("### 51: BACKTEST 2010-2026")
-    try:
-        bdf = yf.download("BTC-USD", start="2010-01-01", end="2026-12-31",
-                          interval="1mo", progress=False, auto_adjust=True)
-        if isinstance(bdf.columns, pd.MultiIndex):
-            bdf.columns = bdf.columns.get_level_values(0)
-        bdf = bdf.dropna()
-
-        if not bdf.empty:
-            equity = (bdf['Close'] / bdf['Close'].iloc[0] * 1000).round(2)
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=bdf.index, y=equity, mode="lines",
-                                      line=dict(color="#00ff88", width=2), name="Equity"))
-            fig2.update_layout(template="plotly_dark", height=450,
-                               paper_bgcolor="#070a12", plot_bgcolor="#070a12",
-                               title="BTC Equity Curve 2010-2026")
-            st.plotly_chart(fig2, use_container_width=True)
-
-            winrate = 85 + random.randint(0, 5)
-            ret = (float(equity.iloc[-1]) / 1000 - 1) * 100
-            st.markdown(
-                f"<div class='card'><b>Final Equity:</b> ${float(equity.iloc[-1]):,.0f} | "
-                f"<b>Start:</b> $1000 | <b>Return:</b> {ret:.0f}% | "
-                f"<b>WinRate:</b> {winrate}% | <b>Trades:</b> ~{len(bdf)*3} | "
-                f"<b>Max DD:</b> -42%</div>",
-                unsafe_allow_html=True
-            )
+    st.markdown("### Live Signals — Time + Entry + Current Move")
+    sym2 = st.selectbox("Coin for signals", COINS, index=0, key="sig_sym")
+    df2 = kl(sym2, "1h", 500)
+    if df2.empty:
+        st.error("Data nahi mila.")
+    else:
+        df2 = ind(df2)
+        sg = signals(df2)
+        if not sg:
+            st.info("Is coin me koi signal nahi mila. Doosra coin try karo.")
         else:
-            st.warning("Backtest data unavailable.")
-    except Exception as e:
-        st.error(f"Backtest error: {e}")
+            rows = []
+            for s in sg[-15:]:
+                t = track(df2, s)
+                move = t["up"] if s["type"] == "BUY" else abs(t["down"])
+                dur = f"{t['hrs']:.1f}h" if not t["live"] else "LIVE"
+                rows.append({
+                    "Time": s["time"].strftime("%Y-%m-%d %H:%M"),
+                    "Type": s["type"],
+                    "Entry $": round(s["price"], 4),
+                    "RSI@Entry": round(s["rsi"], 1),
+                    "Current $": round(t["cur"], 4),
+                    "Max Up %": round(t["up"], 2),
+                    "Max Down %": round(t["down"], 2),
+                    "Duration": dur,
+                    "Result": ("WIN ✅" if move > 1 else "OPEN ⏳" if t["live"] else "LOSS ❌")
+                })
+            ddf = pd.DataFrame(rows).iloc[::-1]
+            st.dataframe(ddf, use_container_width=True, hide_index=True)
 
-# ================= TAB 6 =================
-with tab6:
-    st.markdown("### 50: ACCURACY + TIME")
-    acc = 85 + random.randint(0, 5)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Overall", f"{acc}%", "+2%")
-    c2.metric("H4 Confluence", "88%")
-    c3.metric("M15 Timing", "82%")
-    c4.metric("Combined", f"{acc}%")
+            # Signal cards with graphical bars
+            st.markdown("### 📊 Graphical Signal Tracking")
+            for s, r in zip(sg[-5:], rows[-5:]):
+                t = track(df2, s)
+                move = t["up"] if s["type"] == "BUY" else abs(t["down"])
+                bar_col = "#22c55e" if move > 1 else "#ef4444" if move < 0 else "#f59e0b"
+                bar_w = min(abs(move) * 10, 100)
+                side_col = "buy" if s["type"] == "BUY" else "sell"
+                st.markdown(f"""
+                <div class='card'>
+                <b class='{side_col}'>{s['type']}</b> @ <b>${s['price']:,.4f}</b> 
+                — {s['time'].strftime('%d %b %H:%M')} (RSI {s['rsi']:.1f})<br>
+                Now: <b>${t['cur']:,.4f}</b> | Max Up: <b class='buy'>{t['up']:+.2f}%</b> | 
+                Max Down: <b class='sell'>{t['down']:+.2f}%</b> | 
+                Duration: <b>{t['hrs']:.1f}h</b> {'<span class="hold">LIVE</span>' if t["live"] else ''}
+                <div class='bar' style='margin-top:6px'><div style='width:{bar_w}%;background:{bar_col}'></div></div>
+                </div>
+                """, unsafe_allow_html=True)
 
-    hist = pd.DataFrame({
-        "Timeframe": ["1H","4H","1D","1W"],
-        "Accuracy": [78, 85, 88, 82],
-        "Trades": [450, 320, 180, 60]
-    })
-    st.dataframe(hist, use_container_width=True)
-    st.markdown(
-        f"<div class='card'><b>Update:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"<b>Source:</b> Binance + Yahoo | <b>Market:</b> {mt} {bs}% | "
-        f"<b>Confidence:</b> {acc}%</div>",
-        unsafe_allow_html=True
-    )
+# ============ TAB 3 : AGENTS ============
+with tab3:
+    st.markdown("### 🤖 Agent Discussion — Real Indicator based")
+    sym3 = st.selectbox("Coin for agents", COINS, index=0, key="ag_sym")
+    df3 = kl(sym3, "1h", 200)
+    if df3.empty:
+        st.error("Data nahi mila.")
+    else:
+        df3 = ind(df3)
+        last = df3.iloc[-1]
+        rsi = float(last["rsi"]); vr = float(last["vr"])
+        trend = "BULLISH" if last["ema20"] > last["ema50"] else "BEARISH"
+        atr = float(last["atr"]); px = float(last["c"])
 
-st.caption(f"✅ 51 Features | 46 Agents | 6 Tabs | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        agents = [
+            ("Trend Agent", "EMA 20/50", trend,
+             f"EMA20 {last['ema20']:.2f} {'>' if trend=='BULLISH' else '<'} EMA50 {last['ema50']:.2f}"),
+            ("Momentum Agent", "RSI-14",
+             "OVERBOUGHT" if rsi > 70 else "OVERSOLD" if rsi < 30 else "NEUTRAL",
+             f"RSI {rsi:.1f}"),
+            ("Volume Agent", "VSA / Volume Ratio",
+             f"{vr:.2f}x",
+             f"{'SPIKE — strong participation' if vr>1.5 else 'NORMAL volume'}"),
+            ("Volatility Agent", "ATR-14",
+             f"${atr:.4f}",
+             f"Suggested SL: ${px-2*atr:.4f} | TP: ${px+3*atr:.4f}"),
+            ("Risk Manager", "Position Sizing",
+             "LOW RISK" if vr > 1.2 and 40 < rsi < 65 else "CAUTION",
+             f"SL distance {2*atr/px*100:.2f}%"),
+        ]
+
+        votes_buy = 0; votes_sell = 0
+        for name, role, verdict, msg in agents:
+            if "BULLISH" in verdict or "OVERSOLD" in verdict: votes_buy += 1
+            elif "BEARISH" in verdict or "OVERBOUGHT" in verdict: votes_sell += 1
+            col = "#22c55e" if ("BULL" in verdict or "OVER" not in verdict and "SELL" not in verdict) else "#ef4444"
+            st.markdown(f"""
+            <div class='agent'>
+            <b>🤖 {name}</b> <span style='color:#94a3b8'>({role})</span><br>
+            Verdict: <b style='color:{col}'>{verdict}</b><br>
+            <span style='color:#94a3b8'>{msg}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Consensus
+        if votes_buy > votes_sell:
+            consensus = "BUY / LONG"
+            ccol = "#22c55e"
+        elif votes_sell > votes_buy:
+            consensus = "SELL / SHORT"
+            ccol = "#ef4444"
+        else:
+            consensus = "WAIT / NO TRADE"
+            ccol = "#f59e0b"
+
+        st.markdown(f"""
+        <div class='card' style='border:2px solid {ccol}'>
+        <b>🗳️ Consensus after discussion:</b>
+        <span style='color:{ccol};font-size:22px;font-weight:900'>{consensus}</span><br>
+        Votes — BUY: <b>{votes_buy}</b> | SELL: <b>{votes_sell}</b> | 
+        RSI: <b>{rsi:.1f}</b> | Vol: <b>{vr:.2f}x</b> | Trend: <b>{trend}</b>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ============ TAB 4 : SCANNER ============
+with tab4:
+    st.markdown("### 🔔 Multi-Coin Scanner + Volume Alerts")
+    c1, c2 = st.columns([1, 2])
+    if c1.button("🚀 Scan All Coins"):
+        st.session_state.scan = True
+    scan_on = st.session_state.get("scan", False) or c2.checkbox("Auto scan", value=False)
+
+    if "alerts" not in st.session_state:
+        st.session_state.alerts = []
+
+    if scan_on:
+        rows = []
+        progress = st.progress(0)
+        for idx, s in enumerate(COINS):
+            progress.progress((idx + 1) / len(COINS))
+            t24 = tick24(s)
+            if not t24 or "lastPrice" not in t24:
+                continue
+            lastp = float(t24["lastPrice"])
+            chg = float(t24["priceChangePercent"])
+            volq = float(t24["quoteVolume"])
+            dfx = kl(s, "1h", 60)
+            vr = 0; rsi = 50; trend = "—"
+            if not dfx.empty:
+                dfx = ind(dfx)
+                vr = float(dfx["vr"].iloc[-1]) if not pd.isna(dfx["vr"].iloc[-1]) else 0
+                rsi = float(dfx["rsi"].iloc[-1]) if not pd.isna(dfx["rsi"].iloc[-1]) else 50
+                trend = "BULL" if dfx["ema20"].iloc[-1] > dfx["ema50"].iloc[-1] else "BEAR"
+
+            signal = "—"
+            if trend == "BULL" and rsi < 65: signal = "BUY"
+            elif trend == "BEAR" and rsi > 35: signal = "SELL"
+
+            rows.append({
+                "Coin": s.replace("USDT", ""),
+                "Price $": round(lastp, 4),
+                "24h %": round(chg, 2),
+                "Vol $M": round(volq / 1e6, 1),
+                "Vol Ratio": round(vr, 2),
+                "RSI": round(rsi, 1),
+                "Trend": trend,
+                "Signal": signal,
+                "Alert": "🐳 VOL SPIKE" if vr > 1.5 else ""
+            })
+
+            if vr > 1.5:
+                key = f"{s}-{datetime.now().strftime('%Y%m%d%H')}"
+                if key not in [a["key"] for a in st.session_state.alerts]:
+                    st.session_state.alerts.append({
+                        "key": key,
+                        "msg": f"🐳 {s.replace('USDT','')} volume spike {vr:.2f}x at ${lastp:.4f}",
+                        "time": datetime.now().strftime("%H:%M:%S")
+                    })
+
+        progress.empty()
+        if rows:
+            rdf = pd.DataFrame(rows).sort_values("Vol Ratio", ascending=False)
+            st.dataframe(rdf, use_container_width=True, hide_index=True)
+
+    # Alerts feed
+    st.markdown("### 📢 Live Alerts Feed")
+    if st.session_state.alerts:
+        for a in st.session_state.alerts[-10:][::-1]:
+            st.markdown(f"""
+            <div class='card' style='border-left:4px solid #22c55e'>
+            <b>{a['time']}</b> — {a['msg']}
+            </div>
+            """, unsafe_allow_html=True)
+        if st.button("Clear alerts"):
+            st.session_state.alerts = []
+            st.rerun()
+    else:
+        st.info("Koi alert nahi. Scan chalao.")
+
+st.caption("✅ Real Binance Data • No Demo Values • Rule-based Agents")
