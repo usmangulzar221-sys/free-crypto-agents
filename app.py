@@ -35,7 +35,8 @@ def get_groq_key():
 GROQ_API_KEY = get_groq_key()
 if GROQ_AVAILABLE and GROQ_API_KEY:
     client = Groq(api_key=GROQ_API_KEY)
-    LLM_MODEL = "llama-3.3-70b-versatile"
+    # ✅ Naya model - llama-3.3-70b-versatile deprecated hai
+    LLM_MODEL = "openai/gpt-oss-120b"
 else:
     client = None
     LLM_MODEL = None
@@ -295,7 +296,7 @@ with st.sidebar:
         if uk:
             GROQ_API_KEY = uk
             try:
-                client = Groq(api_key=uk); LLM_MODEL = "llama-3.3-70b-versatile"
+                client = Groq(api_key=uk); LLM_MODEL = "openai/gpt-oss-120b"
                 st.success("✅ Key set!")
             except Exception as e: st.error(f"Invalid: {e}")
         else: st.warning("Free key: [console.groq.com](https://console.groq.com/keys)")
@@ -385,4 +386,45 @@ with tab2:
         for t,p in sup:
             fig.add_hrect(y0=p*0.997,y1=p*1.003,fillcolor="#22c55e",opacity=0.12,line_width=0,row=1,col=1)
             fig.add_hline(y=p,line_dash="dash",line_color="#22c55e",annotation_text=f"SUP {p:,.2f}",annotation_position="right",row=1,col=1)
-        
+        vc = ["#22c55e" if c>=o else "#ef4444" for c,o in zip(df["c"],df["o"])]
+        fig.add_trace(go.Bar(x=df["t"],y=df["v"],marker_color=vc,name="Volume",opacity=0.8),row=2,col=1)
+        fig.add_trace(go.Scatter(x=df["t"],y=df["vavg"],line=dict(color="#fbbf24",width=1),name="Vol Avg"),row=2,col=1)
+        fig.add_trace(go.Scatter(x=df["t"],y=df["rsi"],line=dict(color="#a78bfa",width=1.5),name="RSI"),row=3,col=1)
+        fig.add_hline(y=70,line_dash="dot",line_color="#ef4444",opacity=0.5,row=3,col=1)
+        fig.add_hline(y=30,line_dash="dot",line_color="#22c55e",opacity=0.5,row=3,col=1)
+        fig.update_layout(template="plotly_dark",height=800,paper_bgcolor="#0b0f17",plot_bgcolor="#0b0f17",
+            xaxis_rangeslider_visible=False,legend=dict(orientation="h",y=1.02),
+            margin=dict(l=10,r=70,t=50,b=10),title=f"{sym2} • {itv2} • {DATA_SOURCE['klines']}")
+        fig.update_xaxes(showgrid=True,gridcolor="#1f2937")
+        fig.update_yaxes(showgrid=True,gridcolor="#1f2937")
+        st.plotly_chart(fig, use_container_width=True)
+
+# ---------- TAB 3 ----------
+with tab3:
+    st.markdown("### 📊 Signal Tracker")
+    sym4 = st.selectbox("Coin", COINS, index=0, key="sig_sym")
+    df4 = klines(sym4, "1h", 500)
+    if not df4.empty:
+        df4 = add_indicators(df4)
+        sigs = []
+        for i in range(1, len(df4)):
+            pf,ps = df4["ema20"].iloc[i-1],df4["ema50"].iloc[i-1]
+            cf,cs = df4["ema20"].iloc[i],df4["ema50"].iloc[i]
+            if pd.isna(pf): continue
+            if pf<=ps and cf>cs: sigs.append({"i":i,"time":df4["t"].iloc[i],"price":float(df4["c"].iloc[i]),"type":"BUY"})
+            elif pf>=ps and cf<cs: sigs.append({"i":i,"time":df4["t"].iloc[i],"price":float(df4["c"].iloc[i]),"type":"SELL"})
+        if sigs:
+            rows = []
+            for s in sigs[-15:]:
+                fut = df4.iloc[s["i"]+1:]
+                if fut.empty: up = down = 0; hrs = 0; live = True
+                else:
+                    up = (float(fut["h"].max())-s["price"])/s["price"]*100
+                    down = (float(fut["l"].min())-s["price"])/s["price"]*100
+                    hrs = (df4["t"].iloc[-1]-df4["t"].iloc[s["i"]]).total_seconds()/3600
+                    live = False
+                rows.append({"Time":s["time"].strftime("%m-%d %H:%M"),"Type":s["type"],
+                             "Entry":round(s["price"],4),"Max Up %":round(up,2),
+                             "Max Down %":round(down,2),"Dur":f"{hrs:.1f}h" if not live else "LIVE"})
+            st.dataframe(pd.DataFrame(rows).iloc[::-1], use_container_width=True, hide_index=True)
+        else: st.info("Koi signal nahi mila")
