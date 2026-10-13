@@ -1,6 +1,7 @@
 streamlit
-yfinance
-plotly
-pandas
 requests
+pandas
 numpy
+plotly
+yfinance
+groq
