@@ -4,10 +4,11 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta
 import time, os, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="LLM Agent Scanner PRO", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Pro Trading Scanner", page_icon="📊", layout="wide")
 
 st.markdown("""
 <style>
@@ -16,8 +17,10 @@ st.markdown("""
 .buy{color:#22c55e;font-weight:800}
 .sell{color:#ef4444;font-weight:800}
 .hold{color:#f59e0b;font-weight:800}
-.agent{background:#0f172a;border-radius:10px;padding:12px;margin:8px 0;border-left:4px solid #3b82f6}
+.zone-sup{background:rgba(34,197,94,0.15);padding:4px 8px;border-radius:6px}
+.zone-res{background:rgba(239,68,68,0.15);padding:4px 8px;border-radius:6px}
 .llm-box{background:#1e1b4b;border-radius:10px;padding:12px;margin:8px 0;border-left:4px solid #a855f7}
+.stat-box{background:#111827;border-radius:10px;padding:12px;text-align:center;border:1px solid #1f2937}
 </style>
 """, unsafe_allow_html=True)
 
@@ -33,13 +36,14 @@ def get_groq_key():
     except Exception: return os.environ.get("GROQ_API_KEY", "")
 
 GROQ_API_KEY = get_groq_key()
+client = None
+LLM_MODEL = None
 if GROQ_AVAILABLE and GROQ_API_KEY:
-    client = Groq(api_key=GROQ_API_KEY)
-    # ✅ Naya model - llama-3.3-70b-versatile deprecated hai
-    LLM_MODEL = "openai/gpt-oss-120b"
-else:
-    client = None
-    LLM_MODEL = None
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        LLM_MODEL = "openai/gpt-oss-120b"
+    except Exception:
+        client = None
 
 def llm_call(system_prompt, user_prompt, max_tokens=500):
     if client is None: return None, "❌ Groq API key missing"
@@ -51,35 +55,45 @@ def llm_call(system_prompt, user_prompt, max_tokens=500):
             temperature=0.3, max_tokens=max_tokens, top_p=0.9)
         return c.choices[0].message.content, None
     except Exception as e:
-        return None, f"LLM error: {str(e)[:200]}"
+        return None, f"LLM: {str(e)[:180]}"
 
-# ============ MULTI-SOURCE DATA (OKX → Bybit → CoinGecko) ============
-COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
-         "ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","LTCUSDT","BCHUSDT",
-         "UNIUSDT","SUIUSDT","TRXUSDT","APTUSDT","ATOMUSDT","NEARUSDT",
-         "INJUSDT","MATICUSDT","SHIBUSDT","PEPEUSDT","OPUSDT","ARBUSDT",
-         "TIAUSDT","FILUSDT","ETCUSDT","HBARUSDT","VETUSDT","RUNEUSDT"]
+# ============ OKX DATA (Best for Streamlit Cloud) ============
+OKX_BASE = "https://www.okx.com/api/v5"
+TF_MAP = {"5m":"5m","15m":"15m","1h":"1H","4h":"4H","1d":"1D"}
 
-CG_MAP = {"BTCUSDT":"bitcoin","ETHUSDT":"ethereum","SOLUSDT":"solana",
-    "BNBUSDT":"binancecoin","XRPUSDT":"ripple","DOGEUSDT":"dogecoin",
-    "ADAUSDT":"cardano","AVAXUSDT":"avalanche-2","LINKUSDT":"chainlink",
-    "DOTUSDT":"polkadot","LTCUSDT":"litecoin","BCHUSDT":"bitcoin-cash",
-    "UNIUSDT":"uniswap","SUIUSDT":"sui","TRXUSDT":"tron","APTUSDT":"aptos",
-    "ATOMUSDT":"cosmos","NEARUSDT":"near","INJUSDT":"injective-protocol",
-    "MATICUSDT":"matic-network","SHIBUSDT":"shiba-inu","PEPEUSDT":"pepe",
-    "OPUSDT":"optimism","ARBUSDT":"arbitrum","TIAUSDT":"celestia",
-    "FILUSDT":"filecoin","ETCUSDT":"ethereum-classic",
-    "HBARUSDT":"hedera-hashgraph","VETUSDT":"vechain","RUNEUSDT":"thorchain"}
-
-DATA_SOURCE = {"klines":"?", "price":"?"}
-
-# ---- OKX ----
-def _okx_klines(sym, itv, lim):
+@st.cache_data(ttl=3600)
+def get_all_coins():
+    """Fetch all USDT spot pairs from OKX, sorted by volume"""
     try:
-        s = sym.replace("USDT","-USDT")
-        bar = {"15m":"15m","1h":"1H","4h":"4H","1d":"1D"}.get(itv,"1H")
-        r = requests.get("https://www.okx.com/api/v5/market/candles",
-                         params={"instId":s,"bar":bar,"limit":min(lim,300)},
+        r = requests.get(f"{OKX_BASE}/market/tickers",
+                         params={"instType":"SPOT"}, timeout=10).json()
+        if r.get("code") != "0": return []
+        coins = []
+        for d in r["data"]:
+            inst = d.get("instId","")
+            if not inst.endswith("-USDT"): continue
+            if "USDC" in inst or "DAI" in inst: continue
+            try:
+                vol = float(d.get("volCcy24h", 0))
+            except Exception:
+                vol = 0
+            if vol < 10000: continue
+            coins.append({"symbol": inst.replace("-",""),
+                          "instId": inst,
+                          "vol": vol,
+                          "last": d.get("last","0"),
+                          "chg": d.get("sodUtc8","0")})
+        coins.sort(key=lambda x: x["vol"], reverse=True)
+        return coins[:1000]
+    except Exception:
+        return []
+
+@st.cache_data(ttl=20)
+def klines(sym, itv="1h", lim=300):
+    try:
+        bar = TF_MAP.get(itv, "1H")
+        r = requests.get(f"{OKX_BASE}/market/candles",
+                         params={"instId": f"{sym[:len(sym)-4]}-USDT", "bar": bar, "limit": min(lim,300)},
                          timeout=8).json()
         if r.get("code") != "0" or not r.get("data"): return pd.DataFrame()
         d = r["data"]
@@ -87,102 +101,25 @@ def _okx_klines(sym, itv, lim):
         for col in ["o","h","l","c","v"]: df[col] = df[col].astype(float)
         df["t"] = pd.to_datetime(df["t"].astype(float), unit="ms")
         return df[["t","o","h","l","c","v"]].sort_values("t").reset_index(drop=True)
-    except Exception: return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
-def _okx_ticker(sym):
+@st.cache_data(ttl=15)
+def ticker(sym):
     try:
-        s = sym.replace("USDT","-USDT")
-        r = requests.get("https://www.okx.com/api/v5/market/ticker",
-                         params={"instId":s}, timeout=6).json()
+        r = requests.get(f"{OKX_BASE}/market/ticker",
+                         params={"instId": f"{sym[:len(sym)-4]}-USDT"}, timeout=6).json()
         if r.get("code") != "0" or not r.get("data"): return {}
         d = r["data"][0]
         last = float(d["last"]); op = float(d["open24h"])
         chg = (last-op)/op*100 if op else 0
-        return {"lastPrice":str(last),"priceChangePercent":chg,
-                "highPrice":d.get("high24h","—"),"lowPrice":d.get("low24h","—"),
-                "quoteVolume":d.get("volCcy24h","0")}
-    except Exception: return {}
-
-# ---- Bybit ----
-def _bybit_klines(sym, itv, lim):
-    try:
-        interval = {"15m":"15","1h":"60","4h":"240","1d":"D"}.get(itv,"60")
-        r = requests.get("https://api.bybit.com/v5/market/kline",
-                         params={"category":"spot","symbol":sym,"interval":interval,"limit":min(lim,300)},
-                         timeout=8).json()
-        if r.get("retCode") != 0 or not r.get("result",{}).get("list"): return pd.DataFrame()
-        d = r["result"]["list"]
-        df = pd.DataFrame(d, columns=["t","o","h","l","c","v","turnover"])
-        for col in ["o","h","l","c","v"]: df[col] = df[col].astype(float)
-        df["t"] = pd.to_datetime(df["t"].astype(float), unit="ms")
-        return df[["t","o","h","l","c","v"]].sort_values("t").reset_index(drop=True)
-    except Exception: return pd.DataFrame()
-
-def _bybit_ticker(sym):
-    try:
-        r = requests.get("https://api.bybit.com/v5/market/tickers",
-                         params={"category":"spot","symbol":sym}, timeout=6).json()
-        if r.get("retCode") != 0: return {}
-        d = r["result"]["list"][0]
-        return {"lastPrice":d.get("lastPrice","0"),
-                "priceChangePercent":float(d.get("price24hPcnt",0))*100,
-                "highPrice":d.get("highPrice24h","—"),"lowPrice":d.get("lowPrice24h","—"),
-                "quoteVolume":d.get("turnover24h","0")}
-    except Exception: return {}
-
-# ---- CoinGecko (price only) ----
-def _cg_price(sym):
-    try:
-        cg = CG_MAP.get(sym)
-        if not cg: return None
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
-                         params={"ids":cg,"vs_currencies":"usd","include_24hr_change":"true"},
-                         timeout=8).json()
-        if cg not in r: return None
-        d = r[cg]
-        return {"lastPrice":str(d["usd"]),
-                "priceChangePercent":d.get("usd_24h_change",0),
-                "highPrice":"—","lowPrice":"—","quoteVolume":"0"}
-    except Exception: return None
-
-# ---- Master fetchers with fallback ----
-@st.cache_data(ttl=30)
-def klines(sym, itv="1h", lim=300):
-    df = _okx_klines(sym, itv, lim)
-    if not df.empty:
-        DATA_SOURCE["klines"] = "OKX ✅"
-        return df
-    df = _bybit_klines(sym, itv, lim)
-    if not df.empty:
-        DATA_SOURCE["klines"] = "Bybit ✅"
-        return df
-    DATA_SOURCE["klines"] = "FAILED ❌"
-    return pd.DataFrame()
-
-@st.cache_data(ttl=15)
-def ticker24(sym):
-    t = _okx_ticker(sym)
-    if t:
-        DATA_SOURCE["price"] = "OKX ✅"
-        return t
-    t = _bybit_ticker(sym)
-    if t:
-        DATA_SOURCE["price"] = "Bybit ✅"
-        return t
-    t = _cg_price(sym)
-    if t:
-        DATA_SOURCE["price"] = "CoinGecko ✅"
-        return t
-    DATA_SOURCE["price"] = "FAILED ❌"
-    return {}
-
-@st.cache_data(ttl=15)
-def price_now(sym):
-    t = ticker24(sym)
-    if t and t.get("lastPrice"):
-        try: return float(t["lastPrice"])
-        except Exception: return None
-    return None
+        try: vol = float(d.get("volCcy24h", 0))
+        except Exception: vol = 0
+        return {"lastPrice": last, "chg24h": chg,
+                "high24h": d.get("high24h","—"), "low24h": d.get("low24h","—"),
+                "volUSDT": vol}
+    except Exception:
+        return {}
 
 # ============ INDICATORS ============
 def add_indicators(df):
@@ -205,226 +142,532 @@ def add_indicators(df):
     df["macd_sig"] = df["macd"].ewm(span=9, adjust=False).mean()
     return df
 
-def find_zones(df, lb=5):
+def find_zones(df, lb=5, max_zones=3):
     H = df["h"].values; L = df["l"].values; T = df["t"].values
     res = []; sup = []
     for i in range(lb, len(df)-lb):
         if H[i] == max(H[i-lb:i+lb+1]): res.append((T[i], H[i]))
         if L[i] == min(L[i-lb:i+lb+1]): sup.append((T[i], L[i]))
-    return sup[-3:], res[-3:]
+    return sup[-max_zones:], res[-max_zones:]
 
-# ============ REAL LLM AGENTS ============
-def build_market_snapshot(sym, itv):
-    df = klines(sym, itv, 200)
-    if df.empty: return None, None
-    df = add_indicators(df)
-    sup, res = find_zones(df)
-    last = df.iloc[-1]
-    t24 = ticker24(sym)
-    px = float(last["c"])
-    snap = {"symbol":sym,"timeframe":itv,"price":round(px,4),
-        "ema20":round(float(last["ema20"]),4),"ema50":round(float(last["ema50"]),4),
-        "ema200":round(float(last["ema200"]),4) if not pd.isna(last["ema200"]) else None,
-        "rsi":round(float(last["rsi"]),2) if not pd.isna(last["rsi"]) else None,
-        "atr":round(float(last["atr"]),4) if not pd.isna(last["atr"]) else None,
-        "macd":round(float(last["macd"]),4) if not pd.isna(last["macd"]) else None,
-        "macd_signal":round(float(last["macd_sig"]),4) if not pd.isna(last["macd_sig"]) else None,
-        "volume_ratio":round(float(last["vr"]),2) if not pd.isna(last["vr"]) else None,
-        "high_24h":t24.get("highPrice"),"low_24h":t24.get("lowPrice"),
-        "change_24h":round(t24.get("priceChangePercent",0),2),
-        "supports":[round(float(p),4) for _,p in sup],
-        "resistances":[round(float(p),4) for _,p in res],
-        "recent_candles":df.tail(10)[["t","o","h","l","c","v"]].astype(str).to_dict("records")}
-    return snap, df
+# ============ SIGNAL DETECTION ============
+def detect_signals(df):
+    """Detect BUY/SELL signals with EMA cross + RSI filter"""
+    sigs = []
+    for i in range(1, len(df)):
+        pf, ps = df["ema20"].iloc[i-1], df["ema50"].iloc[i-1]
+        cf, cs = df["ema20"].iloc[i], df["ema50"].iloc[i]
+        r = df["rsi"].iloc[i]
+        if pd.isna(pf) or pd.isna(r): continue
+        if pf <= ps and cf > cs and r < 70:
+            sigs.append({"i": i, "time": df["t"].iloc[i], "price": float(df["c"].iloc[i]),
+                         "type": "BUY", "rsi": float(r)})
+        elif pf >= ps and cf < cs and r > 30:
+            sigs.append({"i": i, "time": df["t"].iloc[i], "price": float(df["c"].iloc[i]),
+                         "type": "SELL", "rsi": float(r)})
+    return sigs
 
-AGENTS = [
-    {"name":"📈 Trend Analyst","system":"You are a professional crypto trend analyst. Reply JSON only: {\"verdict\":\"BULLISH|BEARISH|SIDEWAYS\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."},
-    {"name":"⚡ Momentum Analyst","system":"You are a momentum specialist. Reply JSON only: {\"verdict\":\"STRONG|WEAK|OVERSOLD|OVERBOUGHT|NEUTRAL\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."},
-    {"name":"🐳 Volume Analyst","system":"You are a volume expert. Reply JSON only: {\"verdict\":\"HIGH_VOLUME|NORMAL|LOW_VOLUME\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."},
-    {"name":"🛡️ Risk Manager","system":"You are a risk manager. Reply JSON only: {\"verdict\":\"LOW_RISK|MEDIUM_RISK|HIGH_RISK\",\"score\":-3 to +3,\"sl_price\":number,\"reason\":\"1 short line\"}."},
-    {"name":"🎯 S/R Analyst","system":"You are an S/R expert. Reply JSON only: {\"verdict\":\"NEAR_SUPPORT|NEAR_RESISTANCE|MID_RANGE\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."}
-]
+def track_signal(df, sig, atr):
+    """Track what happened after signal — TP/SL hits, max up/down, duration"""
+    i = sig["i"]; entry = sig["price"]
+    fut = df.iloc[i+1:]
+    if fut.empty:
+        return {"cur": entry, "max_up": 0, "max_down": 0, "dur": 0,
+                "live": True, "tp1": False, "tp2": False, "sl": False,
+                "first_hit": None, "first_hit_time": None}
 
-def run_real_agents(sym, itv):
-    snap, df = build_market_snapshot(sym, itv)
-    if snap is None: return None, "Data fetch failed"
-    out = []
-    for a in AGENTS:
-        prompt = (f"Analyze {snap['symbol']} {snap['timeframe']}:\n"
-                  f"Price: {snap['price']}\nEMA20: {snap['ema20']}\nEMA50: {snap['ema50']}\n"
-                  f"EMA200: {snap['ema200']}\nRSI: {snap['rsi']}\nMACD: {snap['macd']}\n"
-                  f"MACD Sig: {snap['macd_signal']}\nVolRatio: {snap['volume_ratio']}\n"
-                  f"24h Chg: {snap['change_24h']}%\nSupports: {snap['supports']}\n"
-                  f"Resistances: {snap['resistances']}\nRecent: {snap['recent_candles']}")
-        resp, err = llm_call(a["system"], prompt, max_tokens=200)
-        if err:
-            out.append({"name":a["name"],"verdict":"ERROR","score":0,"reason":err,"raw":err}); continue
-        try:
-            txt = resp.strip()
-            if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
-            d = json.loads(txt)
-            out.append({"name":a["name"],"verdict":d.get("verdict","UNKNOWN"),
-                        "score":int(d.get("score",0)),"reason":d.get("reason",""),
-                        "sl_price":d.get("sl_price"),"raw":resp})
-        except Exception:
-            out.append({"name":a["name"],"verdict":"PARSE_ERROR","score":0,
-                        "reason":resp[:120] if resp else "Empty","raw":resp or ""})
-    return out, None
+    if sig["type"] == "BUY":
+        tp1 = entry + 1.5*atr
+        tp2 = entry + 3*atr
+        sl = entry - 2*atr
+    else:
+        tp1 = entry - 1.5*atr
+        tp2 = entry - 3*atr
+        sl = entry + 2*atr
 
-def llm_consensus(snap, results):
-    summary = "\n".join([f"{a['name']}: {a['verdict']} ({a['score']:+d}) — {a['reason']}" for a in results])
-    system = 'You are the Chief Trading Officer. Reply JSON only: {"decision":"BUY|SELL|HOLD","confidence":0-100,"entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,"reasoning":"2 lines"}.'
-    prompt = (f"Market: {snap['symbol']} {snap['timeframe']}\nPrice: {snap['price']}\n"
-              f"ATR: {snap['atr']}\nRSI: {snap['rsi']}\nVolRatio: {snap['volume_ratio']}\n"
-              f"Supports: {snap['supports']}\nResistances: {snap['resistances']}\n\n"
-              f"Analyst Reports:\n{summary}\n\nGive final trading decision.")
-    resp, err = llm_call(system, prompt, max_tokens=400)
-    if err: return None, err
+    tp1_hit = tp2_hit = sl_hit = False
+    first_hit = None; first_time = None
+    for idx, row in fut.iterrows():
+        if sig["type"] == "BUY":
+            if row["h"] >= tp1 and not tp1_hit:
+                tp1_hit = True
+                if first_hit is None: first_hit = "TP1"; first_time = row["t"]
+            if row["h"] >= tp2 and not tp2_hit:
+                tp2_hit = True
+            if row["l"] <= sl and not sl_hit:
+                sl_hit = True
+                if first_hit is None: first_hit = "SL"; first_time = row["t"]
+        else:
+            if row["l"] <= tp1 and not tp1_hit:
+                tp1_hit = True
+                if first_hit is None: first_hit = "TP1"; first_time = row["t"]
+            if row["l"] <= tp2 and not tp2_hit:
+                tp2_hit = True
+            if row["h"] >= sl and not sl_hit:
+                sl_hit = True
+                if first_hit is None: first_hit = "SL"; first_time = row["t"]
+
+    max_up = (float(fut["h"].max()) - entry)/entry*100
+    max_down = (float(fut["l"].min()) - entry)/entry*100
+    dur = (df["t"].iloc[-1] - df["t"].iloc[i]).total_seconds()/3600
+
+    return {"cur": float(df["c"].iloc[-1]), "max_up": max_up, "max_down": max_down,
+            "dur": dur, "live": True, "tp1": tp1_hit, "tp2": tp2_hit, "sl": sl_hit,
+            "first_hit": first_hit, "first_hit_time": first_time,
+            "tp1_price": tp1, "tp2_price": tp2, "sl_price": sl}
+
+# ============ MULTI-COIN SCANNER ============
+def analyze_coin(sym):
+    """Full analysis for one coin - returns dict"""
     try:
-        txt = resp.strip()
-        if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
-        return json.loads(txt), None
+        df = klines(sym, "1h", 200)
+        if df.empty or len(df) < 100: return None
+        df = add_indicators(df)
+        last = df.iloc[-1]
+        px = float(last["c"])
+        rsi = float(last["rsi"]) if not pd.isna(last["rsi"]) else 50
+        vr = float(last["vr"]) if not pd.isna(last["vr"]) else 0
+        atr = float(last["atr"]) if not pd.isna(last["atr"]) else px*0.01
+        ema20 = float(last["ema20"]); ema50 = float(last["ema50"])
+        trend = "BULL" if ema20 > ema50 else "BEAR"
+        t = ticker(sym)
+        chg = t.get("chg24h", 0) if t else 0
+        vol_usdt = t.get("volUSDT", 0) if t else 0
+
+        # Signal logic
+        if trend == "BULL" and rsi < 65 and rsi > 40:
+            signal = "LONG"
+        elif trend == "BEAR" and rsi > 35 and rsi < 60:
+            signal = "SHORT"
+        else:
+            signal = "WAIT"
+
+        # Entry/SL/TP
+        if signal == "LONG":
+            entry = px; sl = px - 2*atr
+            tp1 = px + 1.5*atr; tp2 = px + 3*atr; tp3 = px + 5*atr
+        elif signal == "SHORT":
+            entry = px; sl = px + 2*atr
+            tp1 = px - 1.5*atr; tp2 = px - 3*atr; tp3 = px - 5*atr
+        else:
+            entry = sl = tp1 = tp2 = tp3 = px
+
+        # Strength score
+        strength = 0
+        if trend == "BULL" and signal == "LONG": strength += 30
+        if trend == "BEAR" and signal == "SHORT": strength += 30
+        if 45 < rsi < 60: strength += 15
+        if vr > 1.5: strength += 20
+        if vr > 1.2: strength += 10
+        strength += min(int(chg), 20) if signal == "LONG" and chg > 0 else 0
+        strength += min(int(-chg), 20) if signal == "SHORT" and chg < 0 else 0
+
+        return {
+            "Symbol": sym, "Price": px, "Chg24h": round(chg,2),
+            "VolUSDT_M": round(vol_usdt/1e6, 1),
+            "Trend": trend, "RSI": round(rsi,1),
+            "VolRatio": round(vr,2), "ATR_pct": round(atr/px*100,2),
+            "Signal": signal, "Strength": min(strength, 100),
+            "Entry": round(entry,6), "SL": round(sl,6),
+            "TP1": round(tp1,6), "TP2": round(tp2,6), "TP3": round(tp3,6),
+            "RR": round(abs(tp2-entry)/abs(sl-entry),2) if sl != entry else 0,
+            "EMA20": round(ema20,6), "EMA50": round(ema50,6),
+            "PriceTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
     except Exception:
-        return None, f"Parse failed: {resp[:200]}"
+        return None
 
 # ============ SIDEBAR ============
 with st.sidebar:
-    st.markdown("### 🔑 Groq API Key")
-    if GROQ_API_KEY: st.success("✅ Key loaded")
+    st.markdown("### 🔑 Groq API Key (Optional)")
+    if GROQ_API_KEY:
+        st.success("✅ Key loaded")
     else:
-        uk = st.text_input("Paste Groq API key", type="password")
+        uk = st.text_input("Groq API key (for LLM Agents)", type="password")
         if uk:
-            GROQ_API_KEY = uk
             try:
                 client = Groq(api_key=uk); LLM_MODEL = "openai/gpt-oss-120b"
                 st.success("✅ Key set!")
-            except Exception as e: st.error(f"Invalid: {e}")
-        else: st.warning("Free key: [console.groq.com](https://console.groq.com/keys)")
+            except Exception as e:
+                st.error(f"Invalid: {e}")
+        else:
+            st.info("Free key: [console.groq.com](https://console.groq.com/keys)")
     st.markdown("---")
     st.markdown(f"**Model:** `{LLM_MODEL or 'not set'}`")
-    st.markdown("**Data:** OKX → Bybit → CoinGecko")
-    st.caption("3-source fallback = no failure")
+    st.markdown("**Data:** OKX Spot (1000+ coins)")
+    st.caption("LLM optional — scanner works without it")
 
 # ============ HEADER ============
-btc_p = price_now("BTCUSDT")
-btc_24 = ticker24("BTCUSDT")
-btc_chg = btc_24.get("priceChangePercent",0) if btc_24 else 0
+btc_p = ticker("BTCUSDT")
+btc_last = btc_p.get("lastPrice", 0) if btc_p else 0
+btc_chg = btc_p.get("chg24h", 0) if btc_p else 0
+eth_p = ticker("ETHUSDT")
+sol_p = ticker("SOLUSDT")
 
 c1,c2,c3,c4 = st.columns(4)
-c1.metric("BTC/USDT", f"${btc_p:,.2f}" if btc_p else "—", f"{btc_chg:+.2f}%" if btc_24 else None)
-eth_p = price_now("ETHUSDT"); c2.metric("ETH/USDT", f"${eth_p:,.2f}" if eth_p else "—")
-sol_p = price_now("SOLUSDT"); c3.metric("SOL/USDT", f"${sol_p:,.2f}" if sol_p else "—")
+c1.metric("BTC/USDT", f"${btc_last:,.2f}", f"{btc_chg:+.2f}%")
+c2.metric("ETH/USDT", f"${eth_p.get('lastPrice',0):,.2f}" if eth_p else "—",
+          f"{eth_p.get('chg24h',0):+.2f}%" if eth_p else None)
+c3.metric("SOL/USDT", f"${sol_p.get('lastPrice',0):,.2f}" if sol_p else "—",
+          f"{sol_p.get('chg24h',0):+.2f}%" if sol_p else None)
 c4.metric("Time", datetime.now().strftime("%H:%M:%S"))
 
-st.title("🧠 Real LLM Agent Scanner")
-if not GROQ_API_KEY:
-    st.error("⚠️ Groq key missing! Sidebar me paste karo.")
-else:
-    st.success(f"✅ Real LLM: **{LLM_MODEL}** — 5 Agents, Real AI Calls")
-st.caption(f"Data: {DATA_SOURCE['price']} • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.title("📊 Pro Trading Scanner — 1000+ Coins")
 
 # ============ TABS ============
-tab1, tab2, tab3 = st.tabs(["🧠 LLM Agents","📈 Chart","📊 Signals"])
+tab_chart, tab_scanner, tab_history, tab_llm = st.tabs([
+    "📈 Chart + Zones",
+    "🔔 Live Scanner",
+    "📜 Signal History",
+    "🧠 LLM Agents"
+])
 
-# ---------- TAB 1 ----------
-with tab1:
-    st.markdown("### 🧠 Real LLM Agent Discussion")
-    if not GROQ_API_KEY:
-        st.warning("Pehle sidebar me Groq API key daalo.")
-    else:
-        c1,c2 = st.columns([2,1])
-        sym = c1.selectbox("Coin", COINS, index=0, key="llm_sym")
-        itv = c2.selectbox("TF", ["15m","1h","4h"], index=1, key="llm_tf")
-        if st.button("🚀 Run LLM Agents", type="primary"):
-            with st.spinner(f"5 LLM agents analyzing {sym}..."):
-                t0 = time.time()
-                snap, df = build_market_snapshot(sym, itv)
-                if snap is None:
-                    st.error(f"❌ Data nahi mila. Source: {DATA_SOURCE['klines']}. Dusra coin try karo.")
-                else:
-                    st.markdown(f"""<div class='card'><b>Price:</b> ${snap['price']} | <b>EMA20:</b> {snap['ema20']} | <b>EMA50:</b> {snap['ema50']} | <b>RSI:</b> {snap['rsi']} | <b>ATR:</b> {snap['atr']} | <b>Vol:</b> {snap['volume_ratio']}x | <b>24h:</b> {snap['change_24h']}% <span style='color:#94a3b8'>[{DATA_SOURCE['klines']}]</span></div>""", unsafe_allow_html=True)
-                    results, err = run_real_agents(sym, itv)
-                    if err: st.error(f"❌ {err}")
-                    else:
-                        st.markdown("#### 🗣️ Agent Verdicts")
-                        for a in results:
-                            vcol = "#22c55e" if a['score']>0 else "#ef4444" if a['score']<0 else "#f59e0b"
-                            sl = f"<br><b>Suggested SL:</b> ${a['sl_price']}" if a.get('sl_price') else ""
-                            st.markdown(f"<div class='llm-box' style='border-left-color:{vcol}'><b>{a['name']}</b> → <b style='color:{vcol};font-size:16px'>{a['verdict']}</b> <span style='color:#94a3b8'>(score: {a['score']:+d})</span><br><span style='color:#cbd5e1;font-size:13px'>{a['reason']}</span>{sl}</div>", unsafe_allow_html=True)
-                        st.markdown("#### 👑 Chief LLM Consensus")
-                        with st.spinner("Chief LLM deciding..."):
-                            cons, cerr = llm_consensus(snap, results)
-                            if cerr: st.error(f"❌ {cerr}")
-                            else:
-                                dec = cons.get("decision","HOLD"); conf = cons.get("confidence",0)
-                                dcol = "#22c55e" if dec=="BUY" else "#ef4444" if dec=="SELL" else "#f59e0b"
-                                st.markdown(f"""<div class='card' style='border:3px solid {dcol};text-align:center'><div style='color:#94a3b8;font-size:13px'>FINAL DECISION</div><div style='color:{dcol};font-size:36px;font-weight:900;margin:8px 0'>{dec}</div><div style='color:white'>Confidence: <b>{conf}%</b></div><div style='margin-top:14px;font-size:15px'><b>Entry:</b> ${cons.get('entry',snap['price'])} | <b>SL:</b> <span class='sell'>${cons.get('sl','—')}</span> | <b>TP1:</b> <span class='buy'>${cons.get('tp1','—')}</span> | <b>TP2:</b> <span class='buy'>${cons.get('tp2','—')}</span> | <b>TP3:</b> <span class='buy'>${cons.get('tp3','—')}</span></div><div style='margin-top:12px;color:#cbd5e1;font-style:italic'>"{cons.get('reasoning','')}"</div></div>""", unsafe_allow_html=True)
-                        st.caption(f"✅ {time.time()-t0:.1f}s — {len(AGENTS)+1} real LLM calls")
+# ============ TAB 1: CHART ============
+with tab_chart:
+    st.markdown("### 📈 TradingView-Style Chart")
+    col1, col2, col3 = st.columns([2,1,1])
+    all_coins = get_all_coins()
+    coin_options = [c["symbol"] for c in all_coins[:500]] if all_coins else ["BTCUSDT","ETHUSDT","SOLUSDT"]
+    sym = col1.selectbox("Coin", coin_options, index=0, key="chart_sym")
+    itv = col2.selectbox("Timeframe", ["15m","1h","4h","1d"], index=1, key="chart_tf")
+    show_zones = col3.checkbox("Zones", value=True)
 
-# ---------- TAB 2 ----------
-with tab2:
-    st.markdown("### 📈 Chart + Zones")
-    c1,c2 = st.columns([2,1])
-    sym2 = c1.selectbox("Coin", COINS, index=0, key="chart_sym")
-    itv2 = c2.selectbox("TF", ["15m","1h","4h","1d"], index=1, key="chart_tf")
-    df = klines(sym2, itv2, 300)
+    df = klines(sym, itv, 300)
     if df.empty:
-        st.error(f"❌ Data nahi mila. Source: {DATA_SOURCE['klines']}")
+        st.error(f"❌ Data nahi mila: {sym}. Dusra coin try karo.")
     else:
         df = add_indicators(df)
         sup, res = find_zones(df)
+        sigs = detect_signals(df)
+        last = df.iloc[-1]; atr = float(last["atr"])
+
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                            row_heights=[0.6,0.18,0.22], subplot_titles=("","Volume","RSI"))
-        fig.add_trace(go.Candlestick(x=df["t"],open=df["o"],high=df["h"],low=df["l"],close=df["c"],
-            name=sym2.replace("USDT",""),increasing_line_color="#22c55e",increasing_fillcolor="#22c55e",
-            decreasing_line_color="#ef4444",decreasing_fillcolor="#ef4444"), row=1,col=1)
-        fig.add_trace(go.Scatter(x=df["t"],y=df["ema20"],line=dict(color="#22d3ee",width=1.5),name="EMA20"),row=1,col=1)
-        fig.add_trace(go.Scatter(x=df["t"],y=df["ema50"],line=dict(color="#fbbf24",width=1.5),name="EMA50"),row=1,col=1)
-        for t,p in res:
-            fig.add_hrect(y0=p*0.997,y1=p*1.003,fillcolor="#ef4444",opacity=0.12,line_width=0,row=1,col=1)
-            fig.add_hline(y=p,line_dash="dash",line_color="#ef4444",annotation_text=f"RES {p:,.2f}",annotation_position="right",row=1,col=1)
-        for t,p in sup:
-            fig.add_hrect(y0=p*0.997,y1=p*1.003,fillcolor="#22c55e",opacity=0.12,line_width=0,row=1,col=1)
-            fig.add_hline(y=p,line_dash="dash",line_color="#22c55e",annotation_text=f"SUP {p:,.2f}",annotation_position="right",row=1,col=1)
-        vc = ["#22c55e" if c>=o else "#ef4444" for c,o in zip(df["c"],df["o"])]
-        fig.add_trace(go.Bar(x=df["t"],y=df["v"],marker_color=vc,name="Volume",opacity=0.8),row=2,col=1)
-        fig.add_trace(go.Scatter(x=df["t"],y=df["vavg"],line=dict(color="#fbbf24",width=1),name="Vol Avg"),row=2,col=1)
-        fig.add_trace(go.Scatter(x=df["t"],y=df["rsi"],line=dict(color="#a78bfa",width=1.5),name="RSI"),row=3,col=1)
-        fig.add_hline(y=70,line_dash="dot",line_color="#ef4444",opacity=0.5,row=3,col=1)
-        fig.add_hline(y=30,line_dash="dot",line_color="#22c55e",opacity=0.5,row=3,col=1)
-        fig.update_layout(template="plotly_dark",height=800,paper_bgcolor="#0b0f17",plot_bgcolor="#0b0f17",
-            xaxis_rangeslider_visible=False,legend=dict(orientation="h",y=1.02),
-            margin=dict(l=10,r=70,t=50,b=10),title=f"{sym2} • {itv2} • {DATA_SOURCE['klines']}")
-        fig.update_xaxes(showgrid=True,gridcolor="#1f2937")
-        fig.update_yaxes(showgrid=True,gridcolor="#1f2937")
+                            row_heights=[0.62, 0.16, 0.22],
+                            subplot_titles=("","Volume","RSI"))
+
+        # Candlesticks
+        fig.add_trace(go.Candlestick(
+            x=df["t"], open=df["o"], high=df["h"], low=df["l"], close=df["c"],
+            name=sym,
+            increasing_line_color="#22c55e", increasing_fillcolor="#22c55e",
+            decreasing_line_color="#ef4444", decreasing_fillcolor="#ef4444"),
+            row=1, col=1)
+
+        # EMAs
+        fig.add_trace(go.Scatter(x=df["t"], y=df["ema20"],
+            line=dict(color="#22d3ee", width=1.5), name="EMA20"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["ema50"],
+            line=dict(color="#fbbf24", width=1.5), name="EMA50"), row=1, col=1)
+        if not df["ema200"].isna().all():
+            fig.add_trace(go.Scatter(x=df["t"], y=df["ema200"],
+                line=dict(color="#a855f7", width=1, dash="dot"), name="EMA200"), row=1, col=1)
+
+        # Support/Resistance ZONES (like TradingView sample)
+        if show_zones:
+            for t, p in res[-3:]:
+                fig.add_hrect(y0=p*0.995, y1=p*1.005, fillcolor="#ef4444",
+                              opacity=0.18, line_width=0, row=1, col=1,
+                              annotation_text=f"Resistance", annotation_position="left")
+            for t, p in sup[-3:]:
+                fig.add_hrect(y0=p*0.995, y1=p*1.005, fillcolor="#22c55e",
+                              opacity=0.18, line_width=0, row=1, col=1,
+                              annotation_text=f"Support", annotation_position="left")
+
+        # Buy/Sell signals markers
+        for s in sigs:
+            col = "#22c55e" if s["type"] == "BUY" else "#ef4444"
+            ypos = s["price"]*0.997 if s["type"]=="BUY" else s["price"]*1.003
+            fig.add_trace(go.Scatter(
+                x=[s["time"]], y=[ypos],
+                mode="markers+text",
+                marker=dict(symbol="triangle-up" if s["type"]=="BUY" else "triangle-down",
+                            size=14, color=col, line=dict(color="white", width=1.5)),
+                text=[s["type"]], textposition="bottom center",
+                textfont=dict(color=col, size=10),
+                showlegend=False,
+                hovertemplate=f"<b>{s['type']}</b><br>Price: ${s['price']:,.6f}<br>"
+                              f"RSI: {s['rsi']:.1f}<br>Time: {s['time'].strftime('%m-%d %H:%M')}<extra></extra>"),
+                row=1, col=1)
+
+        # Volume
+        vc = ["#22c55e" if c >= o else "#ef4444" for c, o in zip(df["c"], df["o"])]
+        fig.add_trace(go.Bar(x=df["t"], y=df["v"], marker_color=vc,
+                             name="Volume", opacity=0.85), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["vavg"],
+            line=dict(color="#fbbf24", width=1), name="Vol Avg"), row=2, col=1)
+
+        # RSI
+        fig.add_trace(go.Scatter(x=df["t"], y=df["rsi"],
+            line=dict(color="#a78bfa", width=1.5), name="RSI"), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", opacity=0.6, row=3, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", opacity=0.6, row=3, col=1)
+        fig.add_hline(y=50, line_dash="dot", line_color="#64748b", opacity=0.3, row=3, col=1)
+
+        fig.update_layout(
+            template="plotly_dark", height=850,
+            paper_bgcolor="#0b0f17", plot_bgcolor="#0b0f17",
+            xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", y=1.02, bgcolor="rgba(0,0,0,0)"),
+            margin=dict(l=10, r=80, t=60, b=10),
+            title=f"{sym} • {itv} • Binance-style S/R + Signals")
+        fig.update_xaxes(showgrid=True, gridcolor="#1f2937", row=1, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor="#1f2937", row=2, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor="#1f2937", row=3, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor="#1f2937", row=1, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor="#1f2937", row=2, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor="#1f2937", row=3, col=1)
         st.plotly_chart(fig, use_container_width=True)
 
-# ---------- TAB 3 ----------
-with tab3:
-    st.markdown("### 📊 Signal Tracker")
-    sym4 = st.selectbox("Coin", COINS, index=0, key="sig_sym")
-    df4 = klines(sym4, "1h", 500)
-    if not df4.empty:
-        df4 = add_indicators(df4)
-        sigs = []
-        for i in range(1, len(df4)):
-            pf,ps = df4["ema20"].iloc[i-1],df4["ema50"].iloc[i-1]
-            cf,cs = df4["ema20"].iloc[i],df4["ema50"].iloc[i]
-            if pd.isna(pf): continue
-            if pf<=ps and cf>cs: sigs.append({"i":i,"time":df4["t"].iloc[i],"price":float(df4["c"].iloc[i]),"type":"BUY"})
-            elif pf>=ps and cf<cs: sigs.append({"i":i,"time":df4["t"].iloc[i],"price":float(df4["c"].iloc[i]),"type":"SELL"})
+        # Live info
+        rsi_v = float(last["rsi"]) if not pd.isna(last["rsi"]) else 50
+        vr = float(last["vr"]) if not pd.isna(last["vr"]) else 0
+        trend_col = "#22c55e" if last["ema20"] > last["ema50"] else "#ef4444"
+        rsi_col = "#ef4444" if rsi_v > 70 else "#22c55e" if rsi_v < 30 else "#f59e0b"
+
+        st.markdown(f"""
+        <div class='card'>
+        <b>Price:</b> ${last['c']:,.6f} &nbsp;|&nbsp;
+        <b>EMA20:</b> ${last['ema20']:,.6f} &nbsp;|&nbsp;
+        <b>EMA50:</b> ${last['ema50']:,.6f} &nbsp;|&nbsp;
+        <b>RSI:</b> <span style='color:{rsi_col}'>{rsi_v:.1f}</span> &nbsp;|&nbsp;
+        <b>ATR:</b> {atr/last['c']*100:.2f}% &nbsp;|&nbsp;
+        <b>VolRatio:</b> {vr:.2f}x &nbsp;|&nbsp;
+        <b>Trend:</b> <span style='color:{trend_col}'>{'BULLISH' if last['ema20']>last['ema50'] else 'BEARISH'}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Recent signals on this chart
         if sigs:
+            st.markdown("#### 📜 Recent Signals on Chart")
+            recent_sigs = []
+            for s in sigs[-10:][::-1]:
+                t = track_signal(df, s, atr)
+                recent_sigs.append({
+                    "Time": s["time"].strftime("%m-%d %H:%M"),
+                    "Type": s["type"], "Entry": round(s["price"],6),
+                    "RSI": round(s["rsi"],1),
+                    "Max Up %": round(t["max_up"],2),
+                    "Max Down %": round(t["max_down"],2),
+                    "First Hit": t["first_hit"] or "—",
+                    "Dur": f"{t['dur']:.1f}h"
+                })
+            st.dataframe(pd.DataFrame(recent_sigs), use_container_width=True, hide_index=True)
+
+# ============ TAB 2: SCANNER ============
+with tab_scanner:
+    st.markdown("### 🔔 Multi-Coin Live Scanner")
+    c1, c2, c3 = st.columns([1, 1, 2])
+    scan_count = c1.slider("Coins to scan", 20, 200, 50, 10)
+    min_strength = c2.slider("Min strength", 0, 100, 30, 5)
+    scan_btn = c3.button("🚀 Start Scan", type="primary")
+
+    if "scan_results" not in st.session_state:
+        st.session_state.scan_results = []
+        st.session_state.scan_time = None
+
+    if scan_btn:
+        all_coins = get_all_coins()
+        if not all_coins:
+            st.error("❌ OKX se coins load nahi hue. Retry karo.")
+        else:
+            scan_list = all_coins[:scan_count]
+            st.info(f"Scanning {len(scan_list)} coins (by volume)...")
+            prog = st.progress(0)
+            results = []
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                futures = {ex.submit(analyze_coin, c["symbol"]): c["symbol"] for c in scan_list}
+                done = 0
+                for f in as_completed(futures):
+                    done += 1
+                    prog.progress(done/len(scan_list))
+                    r = f.result()
+                    if r and r["Strength"] >= min_strength:
+                        results.append(r)
+            prog.empty()
+            st.session_state.scan_results = results
+            st.session_state.scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.success(f"✅ Scanned {len(scan_list)} coins in {done}s")
+
+    if st.session_state.scan_results:
+        results = st.session_state.scan_results
+        df_res = pd.DataFrame(results).sort_values("Strength", ascending=False)
+
+        longs = df_res[df_res["Signal"]=="LONG"]
+        shorts = df_res[df_res["Signal"]=="SHORT"]
+        waits = df_res[df_res["Signal"]=="WAIT"]
+
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Total Scanned", len(df_res))
+        m2.metric("LONG 🟢", len(longs))
+        m3.metric("SHORT 🔴", len(shorts))
+        m4.metric("WAIT ⏸️", len(waits))
+        st.caption(f"Last scan: {st.session_state.scan_time}")
+
+        st.markdown("#### 🟢 LONG Signals")
+        if not longs.empty:
+            st.dataframe(longs, use_container_width=True, hide_index=True)
+        else:
+            st.info("No LONG signals right now")
+
+        st.markdown("#### 🔴 SHORT Signals")
+        if not shorts.empty:
+            st.dataframe(shorts, use_container_width=True, hide_index=True)
+        else:
+            st.info("No SHORT signals right now")
+
+        st.markdown("#### ⏸️ WAIT (No clear signal)")
+        if not waits.empty:
+            st.dataframe(waits.head(30), use_container_width=True, hide_index=True)
+
+# ============ TAB 3: SIGNAL HISTORY ============
+with tab_history:
+    st.markdown("### 📜 Signal History & Performance")
+    c1, c2 = st.columns([2,1])
+    all_coins = get_all_coins()
+    coin_options = [c["symbol"] for c in all_coins[:300]] if all_coins else ["BTCUSDT"]
+    hist_sym = c1.selectbox("Coin", coin_options, index=0, key="hist_sym")
+    hist_itv = c2.selectbox("TF", ["15m","1h","4h"], index=1, key="hist_tf")
+
+    df_h = klines(hist_sym, hist_itv, 500)
+    if df_h.empty:
+        st.error("Data nahi mila")
+    else:
+        df_h = add_indicators(df_h)
+        sigs = detect_signals(df_h)
+        if not sigs:
+            st.info("Koi signal nahi mila is coin par")
+        else:
             rows = []
-            for s in sigs[-15:]:
-                fut = df4.iloc[s["i"]+1:]
-                if fut.empty: up = down = 0; hrs = 0; live = True
+            wins = losses = 0
+            for s in sigs[-50:][::-1]:
+                atr = float(df_h["atr"].iloc[s["i"]]) if not pd.isna(df_h["atr"].iloc[s["i"]]) else s["price"]*0.01
+                t = track_signal(df_h, s, atr)
+                if s["type"] == "BUY":
+                    result = "WIN ✅" if t["max_up"] > 1 else "LOSS ❌" if t["max_down"] < -1 else "OPEN ⏳"
                 else:
-                    up = (float(fut["h"].max())-s["price"])/s["price"]*100
-                    down = (float(fut["l"].min())-s["price"])/s["price"]*100
-                    hrs = (df4["t"].iloc[-1]-df4["t"].iloc[s["i"]]).total_seconds()/3600
-                    live = False
-                rows.append({"Time":s["time"].strftime("%m-%d %H:%M"),"Type":s["type"],
-                             "Entry":round(s["price"],4),"Max Up %":round(up,2),
-                             "Max Down %":round(down,2),"Dur":f"{hrs:.1f}h" if not live else "LIVE"})
-            st.dataframe(pd.DataFrame(rows).iloc[::-1], use_container_width=True, hide_index=True)
-        else: st.info("Koi signal nahi mila")
+                    result = "WIN ✅" if t["max_down"] < -1 else "LOSS ❌" if t["max_up"] > 1 else "OPEN ⏳"
+                if "WIN" in result: wins += 1
+                elif "LOSS" in result: losses += 1
+
+                rows.append({
+                    "Time": s["time"].strftime("%Y-%m-%d %H:%M"),
+                    "Type": s["type"],
+                    "Entry": round(s["price"],6),
+                    "SL": round(t.get("sl_price",0),6),
+                    "TP1": round(t.get("tp1_price",0),6),
+                    "TP2": round(t.get("tp2_price",0),6),
+                    "Max Up %": round(t["max_up"],2),
+                    "Max Down %": round(t["max_down"],2),
+                    "TP1 Hit": "✅" if t["tp1"] else "—",
+                    "TP2 Hit": "✅" if t["tp2"] else "—",
+                    "SL Hit": "🔴" if t["sl"] else "—",
+                    "First Hit": t["first_hit"] or "—",
+                    "Duration": f"{t['dur']:.1f}h",
+                    "Result": result
+                })
+
+            total = wins + losses
+            wr = (wins/total*100) if total > 0 else 0
+            m1,m2,m3,m4 = st.columns(4)
+            m1.metric("Total Signals", len(sigs))
+            m2.metric("Wins ✅", wins)
+            m3.metric("Losses ❌", losses)
+            m4.metric("Win Rate", f"{wr:.1f}%")
+
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# ============ TAB 4: LLM AGENTS ============
+with tab_llm:
+    st.markdown("### 🧠 LLM Agent Discussion (Real AI)")
+    if not GROQ_API_KEY:
+        st.warning("⚠️ Groq API key daalo sidebar me (free from console.groq.com)")
+    else:
+        all_coins = get_all_coins()
+        coin_options = [c["symbol"] for c in all_coins[:300]] if all_coins else ["BTCUSDT"]
+        c1, c2 = st.columns([2,1])
+        llm_sym = c1.selectbox("Coin", coin_options, index=0, key="llm_sym")
+        llm_itv = c2.selectbox("TF", ["15m","1h","4h"], index=1, key="llm_tf")
+
+        if st.button("🚀 Run 5 LLM Agents", type="primary"):
+            df_l = klines(llm_sym, llm_itv, 200)
+            if df_l.empty:
+                st.error("Data nahi mila")
+            else:
+                df_l = add_indicators(df_l)
+                last = df_l.iloc[-1]
+                px = float(last["c"])
+                atr = float(last["atr"])
+                snap_str = (f"Symbol: {llm_sym}\nTimeframe: {llm_itv}\nPrice: {px:.6f}\n"
+                            f"EMA20: {float(last['ema20']):.6f}\nEMA50: {float(last['ema50']):.6f}\n"
+                            f"RSI: {float(last['rsi']):.2f}\nMACD: {float(last['macd']):.6f}\n"
+                            f"VolRatio: {float(last['vr']):.2f}\nATR: {atr:.6f}")
+
+                with st.spinner("5 LLM agents analyzing..."):
+                    t0 = time.time()
+                    agents = [
+                        ("📈 Trend Analyst", "You analyze trend. Reply JSON: {\"verdict\":\"BULLISH|BEARISH|SIDEWAYS\",\"score\":-3 to 3,\"reason\":\"1 line\"}"),
+                        ("⚡ Momentum Analyst", "You analyze momentum. Reply JSON: {\"verdict\":\"STRONG|WEAK|NEUTRAL\",\"score\":-3 to 3,\"reason\":\"1 line\"}"),
+                        ("🐳 Volume Analyst", "You analyze volume. Reply JSON: {\"verdict\":\"HIGH|NORMAL|LOW\",\"score\":-3 to 3,\"reason\":\"1 line\"}"),
+                        ("🛡️ Risk Manager", "You assess risk. Reply JSON: {\"verdict\":\"LOW|MEDIUM|HIGH\",\"score\":-3 to 3,\"sl_price\":number,\"reason\":\"1 line\"}"),
+                        ("🎯 S/R Analyst", "You analyze support/resistance. Reply JSON: {\"verdict\":\"NEAR_SUPPORT|NEAR_RESISTANCE|MID\",\"score\":-3 to 3,\"reason\":\"1 line\"}"),
+                    ]
+                    results = []
+                    for name, sys_prompt in agents:
+                        resp, err = llm_call(sys_prompt, snap_str, max_tokens=180)
+                        if err:
+                            results.append({"name": name, "verdict": "ERROR",
+                                            "score": 0, "reason": err, "sl_price": None})
+                            continue
+                        try:
+                            txt = resp.strip()
+                            if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
+                            d = json.loads(txt)
+                            results.append({"name": name, "verdict": d.get("verdict","?"),
+                                            "score": int(d.get("score",0)),
+                                            "reason": d.get("reason",""),
+                                            "sl_price": d.get("sl_price")})
+                        except Exception:
+                            results.append({"name": name, "verdict": "PARSE_ERR",
+                                            "score": 0, "reason": resp[:100], "sl_price": None})
+
+                    for a in results:
+                        vcol = "#22c55e" if a['score']>0 else "#ef4444" if a['score']<0 else "#f59e0b"
+                        sl_txt = f"<br>SL: ${a['sl_price']}" if a.get('sl_price') else ""
+                        st.markdown(f"""
+                        <div class='llm-box' style='border-left-color:{vcol}'>
+                        <b>{a['name']}</b> → <b style='color:{vcol}'>{a['verdict']}</b>
+                        (score {a['score']:+d})<br>
+                        <span style='color:#cbd5e1;font-size:13px'>{a['reason']}</span>{sl_txt}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # Chief consensus
+                    summary = "\n".join([f"{a['name']}: {a['verdict']} ({a['score']:+d})" for a in results])
+                    chief_prompt = f"{snap_str}\n\nAnalyst reports:\n{summary}\n\nGive final decision."
+                    chief_sys = "You are Chief Trader. Reply JSON: {\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"entry\":number,\"sl\":number,\"tp1\":number,\"tp2\":number,\"tp3\":number,\"reasoning\":\"2 lines\"}"
+                    resp, err = llm_call(chief_sys, chief_prompt, max_tokens=400)
+                    if not err:
+                        try:
+                            txt = resp.strip()
+                            if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
+                            cons = json.loads(txt)
+                            dec = cons.get("decision","HOLD")
+                            dcol = "#22c55e" if dec=="BUY" else "#ef4444" if dec=="SELL" else "#f59e0b"
+                            st.markdown(f"""
+                            <div class='card' style='border:3px solid {dcol};text-align:center'>
+                            <div style='color:#94a3b8;font-size:13px'>FINAL DECISION</div>
+                            <div style='color:{dcol};font-size:36px;font-weight:900;margin:8px 0'>{dec}</div>
+                            <div>Confidence: <b>{cons.get('confidence',0)}%</b></div>
+                            <div style='margin-top:14px'>
+                            <b>Entry:</b> ${cons.get('entry','—')} |
+                            <b>SL:</b> <span class='sell'>${cons.get('sl','—')}</span> |
+                            <b>TP1:</b> <span class='buy'>${cons.get('tp1','—')}</span> |
+                            <b>TP2:</b> <span class='buy'>${cons.get('tp2','—')}</span> |
+                            <b>TP3:</b> <span class='buy'>${cons.get('tp3','—')}</span>
+                            </div>
+                            <div style='margin-top:12px;color:#cbd5e1;font-style:italic'>"{cons.get('reasoning','')}"</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        except Exception:
+                            st.error(f"Chief parse failed: {resp[:200]}")
+                    st.caption(f"✅ {time.time()-t0:.1f}s • 6 LLM calls")
