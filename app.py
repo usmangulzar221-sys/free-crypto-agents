@@ -21,7 +21,6 @@ st.markdown("""
 .agent{background:#0f172a;border-radius:10px;padding:12px;margin:8px 0;border-left:4px solid #3b82f6}
 .bar{height:10px;border-radius:5px;background:#1f2937;overflow:hidden;margin-top:6px}
 .bar>div{height:100%;transition:width .3s}
-.metric-box{background:#111827;border-radius:10px;padding:12px;border:1px solid #1f2937;text-align:center}
 .llm-box{background:#1e1b4b;border-radius:10px;padding:12px;margin:8px 0;border-left:4px solid #a855f7}
 </style>
 """, unsafe_allow_html=True)
@@ -34,7 +33,6 @@ except ImportError:
     GROQ_AVAILABLE = False
 
 def get_groq_key():
-    """Priority: Streamlit secrets > environment variable"""
     try:
         return st.secrets["GROQ_API_KEY"]
     except Exception:
@@ -50,7 +48,6 @@ else:
     LLM_MODEL = None
 
 def llm_call(system_prompt, user_prompt, max_tokens=500):
-    """Real LLM call to Groq"""
     if client is None:
         return None, "❌ Groq API key missing. Sidebar me daalo."
     try:
@@ -68,8 +65,9 @@ def llm_call(system_prompt, user_prompt, max_tokens=500):
     except Exception as e:
         return None, f"LLM error: {str(e)[:200]}"
 
-# ============ BINANCE DATA ============
-API = "https://api.binance.com/api/v3"
+# ============ BYBIT API (Reliable on Streamlit Cloud) ============
+BASE = "https://api.bybit.com/v5/market"
+TF_MAP = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
 COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
          "ADAUSDT","AVAXUSDT","LINKUSDT","DOTUSDT","LTCUSDT","BCHUSDT",
          "UNIUSDT","SUIUSDT","TRXUSDT","APTUSDT","ATOMUSDT","NEARUSDT",
@@ -79,16 +77,17 @@ COINS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
 @st.cache_data(ttl=20)
 def klines(sym, itv="1h", lim=300):
     try:
-        r = requests.get(f"{API}/klines",
-                         params={"symbol": sym, "interval": itv, "limit": lim},
-                         timeout=8)
-        d = r.json()
-        if not isinstance(d, list) or len(d) == 0:
-            return pd.DataFrame()
-        df = pd.DataFrame(d, columns=["t","o","h","l","c","v","ct","qv","n","tb","tq","ig"])
-        for col in ["o","h","l","c","v","qv"]:
+        interval = TF_MAP.get(itv, "60")
+        r = requests.get(f"{BASE}/kline",
+                         params={"category": "spot", "symbol": sym, "interval": interval, "limit": lim},
+                         timeout=8).json()
+        if r.get("retCode") != 0: return pd.DataFrame()
+        data = r["result"]["list"]
+        df = pd.DataFrame(data, columns=["t","o","h","l","c","v","turnover"])
+        for col in ["o","h","l","c","v"]:
             df[col] = df[col].astype(float)
-        df["t"] = pd.to_datetime(df["t"], unit="ms")
+        df["t"] = pd.to_datetime(df["t"].astype(float), unit="ms")
+        df = df.sort_values("t").reset_index(drop=True)
         return df
     except Exception:
         return pd.DataFrame()
@@ -96,18 +95,28 @@ def klines(sym, itv="1h", lim=300):
 @st.cache_data(ttl=15)
 def ticker24(sym):
     try:
-        r = requests.get(f"{API}/ticker/24hr", params={"symbol": sym}, timeout=6)
-        return r.json()
+        r = requests.get(f"{BASE}/tickers",
+                         params={"category": "spot", "symbol": sym},
+                         timeout=6).json()
+        if r.get("retCode") != 0: return {}
+        d = r["result"]["list"][0]
+        return {
+            "lastPrice": d.get("lastPrice"),
+            "priceChangePercent": float(d.get("price24hPcnt", 0)) * 100, # Convert to %
+            "highPrice": d.get("highPrice24h"),
+            "lowPrice": d.get("lowPrice24h"),
+            "quoteVolume": d.get("turnover24h")
+        }
     except Exception:
         return {}
 
 @st.cache_data(ttl=15)
 def price_now(sym):
-    try:
-        r = requests.get(f"{API}/ticker/price", params={"symbol": sym}, timeout=5)
-        return float(r.json()["price"])
-    except Exception:
-        return None
+    t = ticker24(sym)
+    if t and t.get("lastPrice"):
+        try: return float(t["lastPrice"])
+        except: return None
+    return None
 
 # ============ INDICATORS ============
 def add_indicators(df):
@@ -129,7 +138,6 @@ def add_indicators(df):
     exp2 = df["c"].ewm(span=26, adjust=False).mean()
     df["macd"] = exp1 - exp2
     df["macd_sig"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_sig"]
     return df
 
 def find_zones(df, lb=5):
@@ -142,7 +150,6 @@ def find_zones(df, lb=5):
 
 # ============ REAL LLM AGENTS ============
 def build_market_snapshot(sym, itv):
-    """Real Binance data snapshot for LLM"""
     df = klines(sym, itv, 200)
     if df.empty:
         return None, None
@@ -152,9 +159,7 @@ def build_market_snapshot(sym, itv):
     t24 = ticker24(sym)
     px = float(last["c"])
     snapshot = {
-        "symbol": sym,
-        "timeframe": itv,
-        "price": round(px, 4),
+        "symbol": sym, "timeframe": itv, "price": round(px, 4),
         "ema20": round(float(last["ema20"]), 4),
         "ema50": round(float(last["ema50"]), 4),
         "ema200": round(float(last["ema200"]), 4) if not pd.isna(last["ema200"]) else None,
@@ -163,114 +168,53 @@ def build_market_snapshot(sym, itv):
         "macd": round(float(last["macd"]), 4) if not pd.isna(last["macd"]) else None,
         "macd_signal": round(float(last["macd_sig"]), 4) if not pd.isna(last["macd_sig"]) else None,
         "volume_ratio": round(float(last["vr"]), 2) if not pd.isna(last["vr"]) else None,
-        "high_24h": t24.get("highPrice"),
-        "low_24h": t24.get("lowPrice"),
-        "change_24h": t24.get("priceChangePercent"),
+        "high_24h": t24.get("highPrice"), "low_24h": t24.get("lowPrice"),
+        "change_24h": round(t24.get("priceChangePercent", 0), 2),
         "supports": [round(float(p), 4) for _, p in sup],
         "resistances": [round(float(p), 4) for _, p in res],
-        "recent_candles": df.tail(10)[["t","o","h","l","c","v"]].to_dict("records")
+        "recent_candles": df.tail(10)[["t","o","h","l","c","v"]].astype(str).to_dict("records")
     }
     return snapshot, df
 
-# 5 REAL LLM AGENTS
 AGENTS = [
-    {
-        "name": "📈 Trend Analyst",
-        "system": "You are a professional crypto trend analyst. Analyze the given market data and give a clear verdict: BULLISH, BEARISH, or SIDEWAYS. Reply in this exact JSON format: {\"verdict\":\"BULLISH|BEARISH|SIDEWAYS\",\"score\":-3 to +3,\"reason\":\"short 1-line reason\"}. No extra text.",
-        "prompt_template": "Analyze this {symbol} {timeframe} market data:\nPrice: {price}\nEMA20: {ema20}\nEMA50: {ema50}\nEMA200: {ema200}\nRecent candles: {recent_candles}\n\nGive trend verdict."
-    },
-    {
-        "name": "⚡ Momentum Analyst",
-        "system": "You are a momentum specialist. Analyze RSI, MACD, and price action. Reply in JSON: {\"verdict\":\"STRONG|WEAK|OVERSOLD|OVERBOUGHT|NEUTRAL\",\"score\":-3 to +3,\"reason\":\"short reason\"}. No extra text.",
-        "prompt_template": "Analyze momentum for {symbol}:\nRSI: {rsi}\nMACD: {macd}\nMACD Signal: {macd_signal}\nPrice: {price}\nEMA20: {ema20}\nEMA50: {ema50}\n\nGive momentum verdict."
-    },
-    {
-        "name": "🐳 Volume Analyst",
-        "system": "You are a volume analysis expert. Analyze volume ratio and 24h data. Reply in JSON: {\"verdict\":\"HIGH_VOLUME|NORMAL|LOW_VOLUME\",\"score\":-3 to +3,\"reason\":\"short reason\"}. No extra text.",
-        "prompt_template": "Analyze volume for {symbol}:\nVolume ratio vs 20avg: {volume_ratio}\n24h change: {change_24h}%\n24h high: {high_24h}\n24h low: {low_24h}\nPrice: {price}\n\nGive volume verdict."
-    },
-    {
-        "name": "🛡️ Risk Manager",
-        "system": "You are a risk manager. Analyze volatility and support/resistance. Reply in JSON: {\"verdict\":\"LOW_RISK|MEDIUM_RISK|HIGH_RISK\",\"score\":-3 to +3,\"sl_price\":number,\"reason\":\"short reason\"}. No extra text.",
-        "prompt_template": "Analyze risk for {symbol}:\nPrice: {price}\nATR: {atr}\nSupports: {supports}\nResistances: {resistances}\nVolume ratio: {volume_ratio}\nRSI: {rsi}\n\nGive risk verdict and suggested SL price."
-    },
-    {
-        "name": "🎯 S/R Analyst",
-        "system": "You are a support/resistance expert. Analyze zones and current price position. Reply in JSON: {\"verdict\":\"NEAR_SUPPORT|NEAR_RESISTANCE|MID_RANGE\",\"score\":-3 to +3,\"reason\":\"short reason\"}. No extra text.",
-        "prompt_template": "Analyze S/R for {symbol}:\nPrice: {price}\nSupports: {supports}\nResistances: {resistances}\nATR: {atr}\n\nGive S/R verdict."
-    }
+    {"name": "📈 Trend Analyst", "system": "You are a professional crypto trend analyst. Reply JSON only: {\"verdict\":\"BULLISH|BEARISH|SIDEWAYS\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."},
+    {"name": "⚡ Momentum Analyst", "system": "You are a momentum specialist. Reply JSON only: {\"verdict\":\"STRONG|WEAK|OVERSOLD|OVERBOUGHT|NEUTRAL\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."},
+    {"name": "🐳 Volume Analyst", "system": "You are a volume expert. Reply JSON only: {\"verdict\":\"HIGH_VOLUME|NORMAL|LOW_VOLUME\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."},
+    {"name": "🛡️ Risk Manager", "system": "You are a risk manager. Reply JSON only: {\"verdict\":\"LOW_RISK|MEDIUM_RISK|HIGH_RISK\",\"score\":-3 to +3,\"sl_price\":number,\"reason\":\"1 short line\"}."},
+    {"name": "🎯 S/R Analyst", "system": "You are an S/R expert. Reply JSON only: {\"verdict\":\"NEAR_SUPPORT|NEAR_RESISTANCE|MID_RANGE\",\"score\":-3 to +3,\"reason\":\"1 short line\"}."}
 ]
 
 def run_real_agents(sym, itv):
-    """Run all 5 agents via REAL LLM calls"""
     snapshot, df = build_market_snapshot(sym, itv)
-    if snapshot is None:
-        return None, "Data fetch failed"
-
+    if snapshot is None: return None, "Data fetch failed"
     results = []
     for agent in AGENTS:
-        prompt = agent["prompt_template"].format(**snapshot)
+        prompt = f"Analyze {snapshot['symbol']} {snapshot['timeframe']}:\nPrice: {snapshot['price']}\nEMA20: {snapshot['ema20']}\nEMA50: {snapshot['ema50']}\nEMA200: {snapshot['ema200']}\nRSI: {snapshot['rsi']}\nMACD: {snapshot['macd']}\nMACD Sig: {snapshot['macd_signal']}\nVolRatio: {snapshot['volume_ratio']}\n24h Chg: {snapshot['change_24h']}%\nSupports: {snapshot['supports']}\nResistances: {snapshot['resistances']}\nRecent: {snapshot['recent_candles']}"
         response, err = llm_call(agent["system"], prompt, max_tokens=200)
         if err:
-            results.append({
-                "name": agent["name"],
-                "verdict": "ERROR",
-                "score": 0,
-                "reason": err,
-                "raw": err
-            })
+            results.append({"name": agent["name"], "verdict": "ERROR", "score": 0, "reason": err, "raw": err})
             continue
-        # Parse JSON from LLM response
         try:
             txt = response.strip()
-            if "```" in txt:
-                txt = txt.split("```")[1].replace("json","").strip()
+            if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
             data = json.loads(txt)
-            results.append({
-                "name": agent["name"],
-                "verdict": data.get("verdict", "UNKNOWN"),
-                "score": int(data.get("score", 0)),
-                "reason": data.get("reason", ""),
-                "sl_price": data.get("sl_price"),
-                "raw": response
-            })
+            results.append({"name": agent["name"], "verdict": data.get("verdict","UNKNOWN"),
+                            "score": int(data.get("score",0)), "reason": data.get("reason",""),
+                            "sl_price": data.get("sl_price"), "raw": response})
         except Exception:
-            results.append({
-                "name": agent["name"],
-                "verdict": "PARSE_ERROR",
-                "score": 0,
-                "reason": response[:120] if response else "Empty",
-                "raw": response or ""
-            })
+            results.append({"name": agent["name"], "verdict": "PARSE_ERROR", "score": 0,
+                            "reason": response[:120] if response else "Empty", "raw": response or ""})
     return results, None
 
 def llm_consensus(snapshot, agent_results):
-    """Real LLM decides final consensus based on agents' opinions"""
-    summary = "\n".join([
-        f"{a['name']}: {a['verdict']} (score {a['score']}) — {a['reason']}"
-        for a in agent_results
-    ])
-    system = """You are the Chief Trading Officer. You see 5 analyst reports. Give final decision.
-Reply in JSON only: {"decision":"BUY|SELL|HOLD","confidence":0-100,"entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,"reasoning":"2-line explanation"}. No extra text."""
-    prompt = f"""Market: {snapshot['symbol']} {snapshot['timeframe']}
-Price: {snapshot['price']}
-ATR: {snapshot['atr']}
-RSI: {snapshot['rsi']}
-Volume ratio: {snapshot['volume_ratio']}
-Supports: {snapshot['supports']}
-Resistances: {snapshot['resistances']}
-
-Analyst Reports:
-{summary}
-
-Give final trading decision."""
+    summary = "\n".join([f"{a['name']}: {a['verdict']} (score {a['score']}) — {a['reason']}" for a in agent_results])
+    system = 'You are the Chief Trading Officer. Reply JSON only: {"decision":"BUY|SELL|HOLD","confidence":0-100,"entry":number,"sl":number,"tp1":number,"tp2":number,"tp3":number,"reasoning":"2 lines"}. No extra text.'
+    prompt = f"Market: {snapshot['symbol']} {snapshot['timeframe']}\nPrice: {snapshot['price']}\nATR: {snapshot['atr']}\nRSI: {snapshot['rsi']}\nVolRatio: {snapshot['volume_ratio']}\nSupports: {snapshot['supports']}\nResistances: {snapshot['resistances']}\n\nAnalyst Reports:\n{summary}\n\nGive final decision."
     response, err = llm_call(system, prompt, max_tokens=400)
-    if err:
-        return None, err
+    if err: return None, err
     try:
         txt = response.strip()
-        if "```" in txt:
-            txt = txt.split("```")[1].replace("json","").strip()
+        if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
         return json.loads(txt), None
     except Exception:
         return None, f"Parse failed: {response[:200]}"
@@ -279,7 +223,7 @@ Give final trading decision."""
 with st.sidebar:
     st.markdown("### 🔑 Groq API Key")
     if GROQ_API_KEY:
-        st.success("✅ Key loaded")
+        st.success("✅ Key loaded successfully")
     else:
         user_key = st.text_input("Paste Groq API key", type="password")
         if user_key:
@@ -292,39 +236,36 @@ with st.sidebar:
                 st.error(f"Invalid key: {e}")
         else:
             st.warning("⚠️ Free key: [console.groq.com](https://console.groq.com/keys)")
-            st.caption("No credit card needed. 30 req/min free.")
-
     st.markdown("---")
     st.markdown(f"**LLM Model:** `{LLM_MODEL or 'not set'}`")
-    st.markdown(f"**Agents:** {len(AGENTS)} real LLM agents")
-    st.caption("Each agent = 1 LLM call")
+    st.markdown(f"**Data Source:** Bybit Public API")
+    st.caption("No API key needed for market data")
 
 # ============ HEADER ============
 btc_p = price_now("BTCUSDT")
 btc_24 = ticker24("BTCUSDT")
-btc_chg = float(btc_24.get("priceChangePercent", 0)) if btc_24 else 0
+btc_chg = btc_24.get("priceChangePercent", 0) if btc_24 else 0
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("BTC/USDT", f"${btc_p:,.2f}" if btc_p else "—",
-            f"{btc_chg:+.2f}%" if btc_24 else None)
+col1.metric("BTC/USDT", f"${btc_p:,.2f}" if btc_p else "—", f"{btc_chg:+.2f}%" if btc_24 else None)
 eth_p = price_now("ETHUSDT")
 col2.metric("ETH/USDT", f"${eth_p:,.2f}" if eth_p else "—")
 sol_p = price_now("SOLUSDT")
 col3.metric("SOL/USDT", f"${sol_p:,.2f}" if sol_p else "—")
 col4.metric("Time", datetime.now().strftime("%H:%M:%S"))
 
-st.title("🧠 Real LLM Agent Scanner — Powered by Groq")
+st.title("🧠 Real LLM Agent Scanner — Bybit Data + Groq AI")
 if not GROQ_API_KEY:
     st.error("⚠️ Groq API key missing! Sidebar me paste karo. [Free key yahan se lo](https://console.groq.com/keys)")
 else:
     st.success(f"✅ Real LLM Active: **{LLM_MODEL}** — 5 Agents, Har Agent Real AI Call")
 
-st.caption(f"Live Binance Data • Real LLM Analysis • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Live Bybit Data • Real LLM Analysis • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ============ TABS ============
 tab1, tab2, tab3, tab4 = st.tabs([
     "🧠 LLM Agent Discussion",
-    "📈 Chart",
+    "📈 Chart + Zones",
     "🔔 Multi-Coin LLM Scanner",
     "📊 Signals Tracker"
 ])
@@ -344,13 +285,13 @@ with tab1:
                 start = time.time()
                 snapshot, df = build_market_snapshot(sym, itv)
                 if snapshot is None:
-                    st.error("❌ Binance data nahi mila")
+                    st.error("❌ Bybit data nahi mila. Dusra coin ya timeframe try karo.")
                 else:
                     results, err = run_real_agents(sym, itv)
                     if err:
                         st.error(f"❌ {err}")
                     else:
-                        st.markdown("#### 📊 Market Snapshot (Real Binance)")
+                        st.markdown("#### 📊 Market Snapshot (Real Bybit Data)")
                         st.markdown(f"""
                         <div class='card'>
                         <b>Price:</b> ${snapshot['price']} &nbsp;|&nbsp;
@@ -365,9 +306,7 @@ with tab1:
 
                         st.markdown("#### 🗣️ Agent Verdicts (Real LLM Responses)")
                         for a in results:
-                            if a['score'] > 0: vcol = "#22c55e"
-                            elif a['score'] < 0: vcol = "#ef4444"
-                            else: vcol = "#f59e0b"
+                            vcol = "#22c55e" if a['score'] > 0 else "#ef4444" if a['score'] < 0 else "#f59e0b"
                             sl_txt = f"<br><b>Suggested SL:</b> ${a['sl_price']}" if a.get('sl_price') else ""
                             st.markdown(f"""
                             <div class='llm-box' style='border-left-color:{vcol}'>
@@ -377,7 +316,6 @@ with tab1:
                             </div>
                             """, unsafe_allow_html=True)
 
-                        # Chief consensus
                         st.markdown("#### 👑 Chief LLM Consensus")
                         with st.spinner("Chief LLM making final decision..."):
                             cons, cerr = llm_consensus(snapshot, results)
@@ -386,9 +324,7 @@ with tab1:
                             else:
                                 dec = cons.get("decision", "HOLD")
                                 conf = cons.get("confidence", 0)
-                                if dec == "BUY": dcol = "#22c55e"
-                                elif dec == "SELL": dcol = "#ef4444"
-                                else: dcol = "#f59e0b"
+                                dcol = "#22c55e" if dec == "BUY" else "#ef4444" if dec == "SELL" else "#f59e0b"
                                 st.markdown(f"""
                                 <div class='card' style='border:3px solid {dcol};text-align:center'>
                                 <div style='color:#94a3b8;font-size:13px'>FINAL LLM DECISION</div>
@@ -406,9 +342,7 @@ with tab1:
                                 </div>
                                 </div>
                                 """, unsafe_allow_html=True)
-
-                        elapsed = time.time() - start
-                        st.caption(f"✅ Analysis complete in {elapsed:.1f}s — {len(AGENTS)+1} real LLM calls made")
+                        st.caption(f"✅ Analysis complete in {time.time()-start:.1f}s — {len(AGENTS)+1} real LLM calls made")
 
 # ================== TAB 2 : CHART ==================
 with tab2:
@@ -419,30 +353,100 @@ with tab2:
 
     df = klines(sym2, itv2, 300)
     if df.empty:
-        st.error("❌ Data nahi mila")
+        st.error("❌ Data nahi mila. Coin ya timeframe change karo.")
     else:
         df = add_indicators(df)
         sup, res = find_zones(df)
-        last = df.iloc[-1]
 
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                            vertical_spacing=0.04,
-                            row_heights=[0.6, 0.18, 0.22],
+                            vertical_spacing=0.04, row_heights=[0.6, 0.18, 0.22],
                             subplot_titles=("", "Volume", "RSI"))
-
-        fig.add_trace(go.Candlestick(
-            x=df["t"], open=df["o"], high=df["h"], low=df["l"], close=df["c"],
-            name=sym2.replace("USDT",""),
-            increasing_line_color="#22c55e", increasing_fillcolor="#22c55e",
-            decreasing_line_color="#ef4444", decreasing_fillcolor="#ef4444"),
-            row=1, col=1)
-
-        fig.add_trace(go.Scatter(x=df["t"], y=df["ema20"],
-            line=dict(color="#22d3ee", width=1.5), name="EMA20"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df["t"], y=df["ema50"],
-            line=dict(color="#fbbf24", width=1.5), name="EMA50"), row=1, col=1)
+        fig.add_trace(go.Candlestick(x=df["t"], open=df["o"], high=df["h"], low=df["l"], close=df["c"],
+            name=sym2.replace("USDT",""), increasing_line_color="#22c55e", increasing_fillcolor="#22c55e",
+            decreasing_line_color="#ef4444", decreasing_fillcolor="#ef4444"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["ema20"], line=dict(color="#22d3ee", width=1.5), name="EMA20"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["ema50"], line=dict(color="#fbbf24", width=1.5), name="EMA50"), row=1, col=1)
 
         for t, p in res:
-            fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#ef4444",
-                          opacity=0.12, line_width=0, row=1, col=1)
-            fig.add_
+            fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#ef4444", opacity=0.12, line_width=0, row=1, col=1)
+            fig.add_hline(y=p, line_dash="dash", line_color="#ef4444", annotation_text=f"RES {p:,.2f}", annotation_position="right", row=1, col=1)
+        for t, p in sup:
+            fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#22c55e", opacity=0.12, line_width=0, row=1, col=1)
+            fig.add_hline(y=p, line_dash="dash", line_color="#22c55e", annotation_text=f"SUP {p:,.2f}", annotation_position="right", row=1, col=1)
+
+        vc = ["#22c55e" if c >= o else "#ef4444" for c, o in zip(df["c"], df["o"])]
+        fig.add_trace(go.Bar(x=df["t"], y=df["v"], marker_color=vc, name="Volume", opacity=0.8), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["vavg"], line=dict(color="#fbbf24", width=1), name="Vol Avg"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df["t"], y=df["rsi"], line=dict(color="#a78bfa", width=1.5), name="RSI"), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", opacity=0.5, row=3, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", opacity=0.5, row=3, col=1)
+
+        fig.update_layout(template="plotly_dark", height=800, paper_bgcolor="#0b0f17", plot_bgcolor="#0b0f17",
+            xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02),
+            margin=dict(l=10, r=70, t=50, b=10), title=f"{sym2} • {itv2} • Live Bybit")
+        fig.update_xaxes(showgrid=True, gridcolor="#1f2937")
+        fig.update_yaxes(showgrid=True, gridcolor="#1f2937")
+        st.plotly_chart(fig, use_container_width=True)
+
+# ================== TAB 3 : LLM SCANNER ==================
+with tab3:
+    st.markdown("### 🔔 Multi-Coin LLM Scanner")
+    st.caption("Har coin ka quick LLM analysis (1 call per coin = fast)")
+    if not GROQ_API_KEY:
+        st.warning("Pehle sidebar me Groq API key daalo.")
+    else:
+        c1, c2 = st.columns([1, 2])
+        top_n = c1.slider("Top N coins", 3, 10, 5)
+        if c2.button("🚀 Scan Top Coins with LLM", type="primary"):
+            with st.spinner("Quick LLM scan running..."):
+                rows = []
+                for sym in COINS[:top_n]:
+                    snap, _ = build_market_snapshot(sym, "1h")
+                    if snap is None: continue
+                    system = "You are a crypto analyst. Reply JSON only: {\"signal\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"1 short line\"}."
+                    prompt = f"Quick call for {sym}: Price {snap['price']}, RSI {snap['rsi']}, EMA20 {snap['ema20']}, EMA50 {snap['ema50']}, VolRatio {snap['volume_ratio']}, 24h {snap['change_24h']}%."
+                    resp, err = llm_call(system, prompt, max_tokens=120)
+                    if err: continue
+                    try:
+                        txt = resp.strip()
+                        if "```" in txt: txt = txt.split("```")[1].replace("json","").strip()
+                        d = json.loads(txt)
+                        rows.append({"Coin": sym.replace("USDT",""), "Price": snap["price"], "RSI": snap["rsi"],
+                                     "VolRatio": snap["volume_ratio"], "24h %": snap["change_24h"],
+                                     "LLM Signal": d.get("signal","—"), "Conf": f"{d.get('confidence',0)}%",
+                                     "Reason": d.get("reason","")})
+                    except Exception: continue
+                    time.sleep(0.5)
+                if rows: st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                else: st.warning("Koi result nahi aaya")
+
+# ================== TAB 4 : SIGNALS ==================
+with tab4:
+    st.markdown("### 📊 Signal Tracker (Indicator-based)")
+    sym4 = st.selectbox("Coin", COINS, index=0, key="sig_sym")
+    df4 = klines(sym4, "1h", 500)
+    if not df4.empty:
+        df4 = add_indicators(df4)
+        sigs = []
+        for i in range(1, len(df4)):
+            pf, ps = df4["ema20"].iloc[i-1], df4["ema50"].iloc[i-1]
+            cf, cs = df4["ema20"].iloc[i], df4["ema50"].iloc[i]
+            if pd.isna(pf): continue
+            if pf <= ps and cf > cs: sigs.append({"i":i,"time":df4["t"].iloc[i],"price":float(df4["c"].iloc[i]),"type":"BUY"})
+            elif pf >= ps and cf < cs: sigs.append({"i":i,"time":df4["t"].iloc[i],"price":float(df4["c"].iloc[i]),"type":"SELL"})
+        if sigs:
+            rows = []
+            for s in sigs[-15:]:
+                fut = df4.iloc[s["i"]+1:]
+                if fut.empty: up = down = 0; hrs = 0; live = True
+                else:
+                    up = (float(fut["h"].max())-s["price"])/s["price"]*100
+                    down = (float(fut["l"].min())-s["price"])/s["price"]*100
+                    hrs = (df4["t"].iloc[-1] - df4["t"].iloc[s["i"]]).total_seconds()/3600
+                    live = False
+                rows.append({"Time": s["time"].strftime("%m-%d %H:%M"), "Type": s["type"],
+                             "Entry": round(s["price"],4), "Max Up %": round(up,2),
+                             "Max Down %": round(down,2), "Dur": f"{hrs:.1f}h" if not live else "LIVE"})
+            st.dataframe(pd.DataFrame(rows).iloc[::-1], use_container_width=True, hide_index=True)
+        else:
+            st.info("Koi signal nahi mila")
