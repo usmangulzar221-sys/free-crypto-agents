@@ -3,5 +3,4 @@ requests
 pandas
 numpy
 plotly
-yfinance
 groq
