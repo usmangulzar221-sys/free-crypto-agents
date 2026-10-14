@@ -399,4 +399,42 @@ with T3:
                 if rs2=="WIN": w += 1
                 elif rs2=="LOSS": l2 += 1
                 rows.append({"Time":s["t"].strftime("%m-%d %H:%M"),"Type":s["ty"],"Entry":round(s["p"],6),"RSI":round(s["r"],1),"MaxUp%":round(tr["mu"],2),"MaxDown%":round(tr["md"],2),"TP1":"Y" if tr["tp1"] else "-","TP2":"Y" if tr["tp2"] else "-","SL":"Y" if tr["sl"] else "-","First":tr["fh"] or "-","Dur":"{:.1f}h".format(tr["du"]),"Result":rs2})
-            tot = w + l2; 
+            tot = w + l2; wr = (w/tot*100) if tot>0 else 0
+            m1,m2,m3,m4 = st.columns(4)
+            m1.metric("Total", len(sg)); m2.metric("Wins", w); m3.metric("Losses", l2); m4.metric("WinRate", "{:.1f}%".format(wr))
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+with T4:
+    st.markdown("### LLM Agents")
+    if not GK: st.warning("Add Groq key in sidebar")
+    else:
+        al = get_coins()
+        opt = [c["s"] for c in al[:300]] if al else ["BTCUSDT"]
+        cc1,cc2 = st.columns([2,1])
+        ls = cc1.selectbox("Coin", opt, index=0, key="ls")
+        li = cc2.selectbox("TF",["15m","1h","4h"], index=1, key="li")
+        if st.button("Run Agents", type="primary"):
+            with st.spinner("Running..."):
+                t0 = time.time()
+                s, df = SNAP(ls, li)
+                if s is None: st.error("No data")
+                else:
+                    st.markdown("<div class='card'><b>Price:</b> $"+str(s["p"])+" <b>RSI:</b> "+str(s["rsi"])+" <b>VolRatio:</b> "+str(s["vr"])+"x <b>F&G:</b> "+str(s["fg"]["v"])+" <b>BTC.D:</b> "+str(s["btc"])+"%</div>", unsafe_allow_html=True)
+                    res, e = RUN(ls, li)
+                    if e: st.error(e)
+                    else:
+                        st.markdown("#### Agent Verdicts")
+                        for a in res:
+                            vc = "#22c55e" if a["s"]>0 else "#ef4444" if a["s"]<0 else "#f59e0b"
+                            st.markdown("<div class='llm' style='border-left-color:"+vc+"'><b>"+a["n"]+"</b> -> <b style='color:"+vc+"'>"+str(a["v"])+"</b> (score "+str(a["s"])+")<br><span style='color:#cbd5e1;font-size:13px'>"+str(a["r"])+"</span></div>", unsafe_allow_html=True)
+                        st.markdown("#### Chief Decision")
+                        with st.spinner("Chief deciding..."):
+                            cons, ce = CHIEF(s, res)
+                            if ce: st.error(ce)
+                            else:
+                                d = cons.get("decision","HOLD"); cf = cons.get("confidence",0)
+                                dc = "#22c55e" if d=="BUY" else "#ef4444" if d=="SELL" else "#f59e0b"
+                                st.markdown("<div class='card' style='border:3px solid "+dc+";text-align:center'><div style='color:#94a3b8'>FINAL</div><div style='color:"+dc+";font-size:34px;font-weight:900'>"+str(d)+"</div><div>Confidence: "+str(cf)+"%</div><div style='margin-top:12px'><b>Entry:</b> $"+str(cons.get("entry","-"))+" <b>SL:</b> $"+str(cons.get("sl","-"))+" <b>TP1:</b> $"+str(cons.get("tp1","-"))+" <b>TP2:</b> $"+str(cons.get("tp2","-"))+"</div><div style='margin-top:10px;font-style:italic'>"+str(cons.get("reasoning",""))+"</div></div>", unsafe_allow_html=True)
+                        st.caption("Done in {:.1f}s".format(time.time()-t0))
+
+st.caption("Pro Scanner - Live OKX Data - " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
