@@ -54,10 +54,16 @@ def KL(s, i="1h", n=300, m="SPOT"):
             return pd.DataFrame()
         d = r["data"]
         df = pd.DataFrame(d, columns=["t", "o", "h", "l", "c", "v", "vq", "vc", "x"])
+        df = df[df["x"] == "1"]
+        if df.empty:
+            df = pd.DataFrame(d, columns=["t", "o", "h", "l", "c", "v", "vq", "vc", "x"])
         for c in ["o", "h", "l", "c", "v"]:
-            df[c] = df[c].astype(float)
-        df["t"] = pd.to_datetime(df["t"].astype(float), unit="ms")
-        return df[["t", "o", "h", "l", "c", "v"]].sort_values("t").reset_index(drop=True)
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["t"] = pd.to_datetime(pd.to_numeric(df["t"], errors="coerce"), unit="ms")
+        df = df.dropna(subset=["t", "o", "h", "l", "c", "v"])
+        df = df[(df["o"] > 0) & (df["h"] > 0) & (df["l"] > 0) & (df["c"] > 0)]
+        df = df[["t", "o", "h", "l", "c", "v"]].sort_values("t").reset_index(drop=True)
+        return df
     except:
         return pd.DataFrame()
 
