@@ -50,13 +50,17 @@ AGS = [
     ("Momentum", "You are momentum analyst. Reply JSON only with keys verdict (STRONG or WEAK or NEUTRAL), score (-3 to 3), reason (one line)."),
     ("Volume", "You are volume analyst. Reply JSON only with keys verdict (HIGH or NORMAL or LOW), score (-3 to 3), reason (one line)."),
     ("Risk", "You are risk manager. Reply JSON only with keys verdict (LOW or MEDIUM or HIGH), score (-3 to 3), sl_price (number), reason (one line)."),
-    ("SR", "You are S/R analyst. Reply JSON only with keys verdict (NEAR_SUPPORT or NEAR_RESISTANCE or MID), score (-3 to 3), reason (one line)."),
-    ("Sentiment", "You analyze sentiment. Reply JSON only with keys verdict (GREEDY or FEARFUL or NEUTRAL), score (-3 to 3), reason (one line)."),
+    ("SupportResistance", "You are S/R analyst. Reply JSON only with keys verdict (NEAR_SUPPORT or NEAR_RESISTANCE or MID), score (-3 to 3), reason (one line)."),
+    ("Sentiment", "You analyze sentiment using fear greed and BTC dominance. Reply JSON only with keys verdict (GREEDY or FEARFUL or NEUTRAL), score (-3 to 3), reason (one line)."),
     ("Indicator", "You analyze indicators. Reply JSON only with keys verdict (BULLISH or BEARISH or NEUTRAL), score (-3 to 3), reason (one line)."),
     ("Volatility", "You analyze volatility. Reply JSON only with keys verdict (HIGH or NORMAL or LOW), score (-3 to 3), reason (one line)."),
-    ("Flow", "You analyze money flow. Reply JSON only with keys verdict (INFLOW or OUTFLOW or NEUTRAL), score (-3 to 3), reason (one line)."),
-    ("Regime", "You identify regime. Reply JSON only with keys verdict (TRENDING or RANGING or VOLATILE), score (-3 to 3), reason (one line)."),
-    ("CVD", "You analyze CVD. Reply JSON only with keys verdict (BUY_DOM or SELL_DOM), score (-3 to 3), reason (one line)."),
+    ("MoneyFlow", "You analyze money flow. Reply JSON only with keys verdict (INFLOW or OUTFLOW or NEUTRAL), score (-3 to 3), reason (one line)."),
+    ("Regime", "You identify market regime. Reply JSON only with keys verdict (TRENDING or RANGING or VOLATILE), score (-3 to 3), reason (one line)."),
+    ("CVD", "You analyze CVD cumulative volume delta. Reply JSON only with keys verdict (BUY_DOM or SELL_DOM), score (-3 to 3), reason (one line)."),
+    ("Bollinger", "You analyze Bollinger Bands. Reply JSON only with keys verdict (UPPER_BREAK or LOWER_BREAK or SQUEEZE or NORMAL), score (-3 to 3), reason (one line)."),
+    ("AdxStrength", "You analyze ADX trend strength. Reply JSON only with keys verdict (STRONG_TREND or WEAK_TREND or NO_TREND), score (-3 to 3), reason (one line)."),
+    ("Divergence", "You analyze RSI divergence. Reply JSON only with keys verdict (BULL_DIV or BEAR_DIV or NO_DIV), score (-3 to 3), reason (one line)."),
+    ("Pattern", "You analyze candlestick patterns. Reply JSON only with keys verdict (BULL_PATTERN or BEAR_PATTERN or NEUTRAL), score (-3 to 3), reason (one line)."),
 ]
 
 def R1(snap_text):
@@ -74,10 +78,10 @@ def R1(snap_text):
     return res
 
 def R2(snap_text, r1):
-    sm = "Round 1:\n"
+    sm = "Round 1 opinions:\n"
     for a in r1:
         sm += a["n"] + ": " + str(a["v"]) + " (" + str(a["s"]) + ")\n"
-    sy = "You are senior strategist. Read all opinions. Reply JSON only with keys verdict (BULLISH or BEARISH or NEUTRAL), score (-3 to 3), reason (one line)."
+    sy = "You are senior strategist. Read all opinions and debate. Reply JSON only with keys verdict (BULLISH or BEARISH or NEUTRAL), score (-3 to 3), reason (one line summary)."
     rr, ee = L(sy, snap_text + "\n\n" + sm, 200)
     if ee:
         return {"n": "Senior", "v": "?", "s": 0, "r": ee[:50]}
@@ -87,12 +91,12 @@ def R2(snap_text, r1):
     return {"n": "Senior", "v": d.get("verdict", "?"), "s": int(d.get("score", 0)), "r": d.get("reason", "")}
 
 def R3(snap_text, r1, r2):
-    sm = "Round 1:\n"
+    sm = "Round 1 opinions:\n"
     for a in r1:
         sm += a["n"] + ": " + str(a["v"]) + " (" + str(a["s"]) + ")\n"
-    sm += "\nSenior: " + str(r2["v"]) + " (" + str(r2["s"]) + ")"
-    sy = "You are Chief. Reply JSON only with keys decision (BUY or SELL or HOLD), market_type (SPOT or FUTURES), confidence (0-100), entry, sl, tp1, tp2, tp3, reasoning (2 lines)."
-    rr, ee = L(sy, snap_text + "\n\n" + sm + "\n\nFinal decision.", 400)
+    sm += "\nSenior debate: " + str(r2["v"]) + " (" + str(r2["s"]) + ")"
+    sy = "You are Chief Trading Officer. Reply JSON only with keys decision (BUY or SELL or HOLD), market_type (SPOT or FUTURES), confidence (0-100), entry (number), sl (number), tp1 (number), tp2 (number), tp3 (number), reasoning (2 lines)."
+    rr, ee = L(sy, snap_text + "\n\n" + sm + "\n\nFinal trading decision.", 400)
     if ee:
         return None, ee
     d = PJ(rr)
