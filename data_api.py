@@ -3,7 +3,9 @@ from datetime import datetime, timedelta
 import streamlit as st
 
 OK = "https://www.okx.com/api/v5"
+BY = "https://api.bybit.com/v5/market"
 TFM = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
+TFB = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
 
 def PKT():
     return (datetime.utcnow() + timedelta(hours=5)).strftime("%I:%M:%S %p")
@@ -11,10 +13,16 @@ def PKT():
 def PKT24():
     return (datetime.utcnow() + timedelta(hours=5)).strftime("%H:%M:%S")
 
+def PKTDT():
+    return (datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d %I:%M:%S %p")
+
 def IID(s, m):
     if m == "SPOT":
         return s[:-4] + "-USDT" if s.endswith("USDT") else s
     return s[:-4] + "-USDT-SWAP" if s.endswith("USDT") else s
+
+def BYSID(s):
+    return s if s.endswith("USDT") else s + "USDT"
 
 @st.cache_data(ttl=3600)
 def COINS(market="SPOT"):
@@ -46,8 +54,7 @@ def COINS(market="SPOT"):
     except:
         return []
 
-@st.cache_data(ttl=20)
-def KL(s, i="1h", n=300, m="SPOT"):
+def _okx_kl(s, i, n, m):
     try:
         r = requests.get(OK + "/market/candles", params={"instId": IID(s, m), "bar": TFM.get(i, "1H"), "limit": min(n, 300)}, timeout=10).json()
         if r.get("code") != "0" or not r.get("data"):
@@ -62,13 +69,38 @@ def KL(s, i="1h", n=300, m="SPOT"):
         df["t"] = pd.to_datetime(pd.to_numeric(df["t"], errors="coerce"), unit="ms")
         df = df.dropna(subset=["t", "o", "h", "l", "c", "v"])
         df = df[(df["o"] > 0) & (df["h"] > 0) & (df["l"] > 0) & (df["c"] > 0)]
-        df = df[["t", "o", "h", "l", "c", "v"]].sort_values("t").reset_index(drop=True)
-        return df
+        return df[["t", "o", "h", "l", "c", "v"]].sort_values("t").reset_index(drop=True)
     except:
         return pd.DataFrame()
 
-@st.cache_data(ttl=10)
-def TX(s, m="SPOT"):
+def _bybit_kl(s, i, n, m):
+    try:
+        cat = "spot" if m == "SPOT" else "linear"
+        r = requests.get(BY + "/kline", params={"category": cat, "symbol": BYSID(s), "interval": TFB.get(i, "60"), "limit": min(n, 300)}, timeout=10).json()
+        if r.get("retCode") != 0 or not r.get("result", {}).get("list"):
+            return pd.DataFrame()
+        d = r["result"]["list"]
+        df = pd.DataFrame(d, columns=["t", "o", "h", "l", "c", "v", "tn"])
+        for c in ["o", "h", "l", "c", "v"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["t"] = pd.to_datetime(pd.to_numeric(df["t"], errors="coerce"), unit="ms")
+        df = df.dropna(subset=["t", "o", "h", "l", "c", "v"])
+        df = df[(df["o"] > 0) & (df["h"] > 0) & (df["l"] > 0) & (df["c"] > 0)]
+        return df[["t", "o", "h", "l", "c", "v"]].sort_values("t").reset_index(drop=True)
+    except:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=20)
+def KL(s, i="1h", n=300, m="SPOT"):
+    df = _okx_kl(s, i, n, m)
+    if not df.empty and len(df) >= 30:
+        return df
+    df2 = _bybit_kl(s, i, n, m)
+    if not df2.empty and len(df2) >= 30:
+        return df2
+    return df if not df.empty else df2
+
+def _okx_tx(s, m):
     try:
         r = requests.get(OK + "/market/ticker", params={"instId": IID(s, m)}, timeout=8).json()
         if r.get("code") != "0" or not r.get("data"):
@@ -84,6 +116,27 @@ def TX(s, m="SPOT"):
         return {"p": la, "c": cg, "v": vl, "h24": float(d.get("high24h", la)), "l24": float(d.get("low24h", la))}
     except:
         return {}
+
+def _bybit_tx(s, m):
+    try:
+        cat = "spot" if m == "SPOT" else "linear"
+        r = requests.get(BY + "/tickers", params={"category": cat, "symbol": BYSID(s)}, timeout=8).json()
+        if r.get("retCode") != 0 or not r.get("result", {}).get("list"):
+            return {}
+        d = r["result"]["list"][0]
+        la = float(d.get("lastPrice", 0))
+        cg = float(d.get("price24hPcnt", 0)) * 100
+        vl = float(d.get("turnover24h", 0))
+        return {"p": la, "c": cg, "v": vl, "h24": float(d.get("highPrice24h", la)), "l24": float(d.get("lowPrice24h", la))}
+    except:
+        return {}
+
+@st.cache_data(ttl=10)
+def TX(s, m="SPOT"):
+    r = _okx_tx(s, m)
+    if r:
+        return r
+    return _bybit_tx(s, m)
 
 @st.cache_data(ttl=60)
 def OI_FR(s):
