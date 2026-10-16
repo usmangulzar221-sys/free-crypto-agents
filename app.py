@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import json
 
 st.set_page_config(page_title="Pro Scanner", layout="wide")
-st.markdown("<style>.stApp{background:#0b0f17;color:#e5e7eb}.card{background:#111827;border-radius:12px;padding:12px;border:1px solid #1f2937;margin:6px 0}.buy{color:#22c55e;font-weight:800}.sell{color:#ef4444;font-weight:800}.hold{color:#f59e0b;font-weight:800}.llm{background:#1e1b4b;border-radius:10px;padding:10px;margin:6px 0;border-left:4px solid #a855f7}.sig{background:#1e293b;border-radius:10px;padding:12px;margin:8px 0;border-left:5px solid #22c55e}.sigS{border-left-color:#ef4444}.big{font-size:30px;font-weight:900}.prog{height:10px;background:#1f2937;border-radius:5px;margin-top:8px;overflow:hidden}.prog>div{height:100%}.zone{background:#1e293b;border-radius:8px;padding:6px;margin:4px 0;display:flex;justify-content:space-between;font-size:13px}</style>", unsafe_allow_html=True)
+st.markdown("<style>.stApp{background:#0b0f17;color:#e5e7eb}.card{background:#111827;border-radius:12px;padding:12px;border:1px solid #1f2937;margin:6px 0}.buy{color:#22c55e;font-weight:800}.sell{color:#ef4444;font-weight:800}.hold{color:#f59e0b;font-weight:800}.llm{background:#1e1b4b;border-radius:10px;padding:10px;margin:6px 0;border-left:4px solid #a855f7}.sig{background:#1e293b;border-radius:10px;padding:12px;margin:8px 0;border-left:5px solid #22c55e}.sigS{border-left-color:#ef4444}.big{font-size:30px;font-weight:900}.prog{height:10px;background:#1f2937;border-radius:5px;margin-top:8px;overflow:hidden}.prog>div{height:100%}</style>", unsafe_allow_html=True)
 
 OK = "https://www.okx.com/api/v5"
 BY = "https://api.bybit.com/v5/market"
@@ -91,12 +91,20 @@ def COINS(m="SPOT"):
                 v = float(d.get("volCcy24h", 0))
             except:
                 v = 0
-            if v < 100000:
+            if v < 500000:
                 continue
             out.append(s)
-        return out[:200] if out else ["BTCUSDT","ETHUSDT","SOLUSDT"]
+        return out[:120] if out else ["BTCUSDT","ETHUSDT","SOLUSDT"]
     except:
         return ["BTCUSDT","ETHUSDT","SOLUSDT"]
+
+def _clean(df, cols):
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=cols)
+    for c in ["o","h","l","c"]:
+        df = df[df[c] > 0]
+    return df
 
 def _ok_kl(s, i, n, m):
     try:
@@ -108,11 +116,8 @@ def _ok_kl(s, i, n, m):
         df = df[df["x"] == "1"]
         if df.empty:
             df = pd.DataFrame(d, columns=["t","o","h","l","c","v","vq","vc","x"])
-        for c in ["o","h","l","c","v"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
         df["t"] = pd.to_datetime(pd.to_numeric(df["t"], errors="coerce"), unit="ms")
-        df = df.dropna(subset=["t","o","h","l","c","v"])
-        df = df[(df["o"]>0)&(df["h"]>0)&(df["l"]>0)&(df["c"]>0)]
+        df = _clean(df, ["t","o","h","l","c","v"])
         return df[["t","o","h","l","c","v"]].sort_values("t").reset_index(drop=True)
     except:
         return pd.DataFrame()
@@ -125,11 +130,8 @@ def _by_kl(s, i, n, m):
             return pd.DataFrame()
         d = r["result"]["list"]
         df = pd.DataFrame(d, columns=["t","o","h","l","c","v","tn"])
-        for c in ["o","h","l","c","v"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
         df["t"] = pd.to_datetime(pd.to_numeric(df["t"], errors="coerce"), unit="ms")
-        df = df.dropna(subset=["t","o","h","l","c","v"])
-        df = df[(df["o"]>0)&(df["h"]>0)&(df["l"]>0)&(df["c"]>0)]
+        df = _clean(df, ["t","o","h","l","c","v"])
         return df[["t","o","h","l","c","v"]].sort_values("t").reset_index(drop=True)
     except:
         return pd.DataFrame()
@@ -188,17 +190,6 @@ def OIFR(s):
         return {"oi": oi, "fr": fr}
     except:
         return {"oi": 0, "fr": 0}
-
-@st.cache_data(ttl=15)
-def BOOK(s, m="SPOT"):
-    try:
-        r = requests.get(OK + "/market/books", params={"instId": OID(s,m), "sz": 20}, timeout=8).json()
-        if r.get("code") != "0" or not r.get("data"):
-            return {"bids":[],"asks":[]}
-        d = r["data"][0]
-        return {"bids":[(float(x[0]),float(x[1])) for x in d.get("bids",[])], "asks":[(float(x[0]),float(x[1])) for x in d.get("asks",[])]}
-    except:
-        return {"bids":[],"asks":[]}
 
 @st.cache_data(ttl=300)
 def FG():
@@ -268,9 +259,6 @@ def IND(df):
     up = df["c"].diff().clip(lower=0)*df["v"]
     dn = (-df["c"].diff()).clip(lower=0)*df["v"]
     df["cvd"] = (up-dn).cumsum()
-    df["kc_mid"] = df["c"].ewm(span=20).mean()
-    df["kc_up"] = df["kc_mid"]+2*at14
-    df["kc_dn"] = df["kc_mid"]-2*at14
     return df
 
 def ZN(df, lb=5):
@@ -300,7 +288,7 @@ def SG(df):
 def TRK(df, s, atr):
     i = s["i"]; e = s["p"]
     f = df.iloc[i+1:]
-    r = {"mu":0,"md":0,"du":0,"tp1":False,"tp2":False,"sl":False,"fh":None,"cur":e,"slp":0,"tp1p":0,"tp2p":0,"sl_t":None,"tp1_t":None,"tp2_t":None}
+    r = {"mu":0,"md":0,"du":0,"tp1":False,"tp2":False,"sl":False,"fh":None,"slp":0,"tp1p":0,"tp2p":0,"sl_t":None,"tp1_t":None,"tp2_t":None}
     if f.empty:
         return r
     tp1p = e + 1.5*atr if s["ty"]=="BUY" else e - 1.5*atr
@@ -329,7 +317,7 @@ def TRK(df, s, atr):
     mu = (float(f["h"].max())-e)/e*100
     md = (float(f["l"].min())-e)/e*100
     du = (df["t"].iloc[-1]-df["t"].iloc[i]).total_seconds()/3600
-    return {"mu":mu,"md":md,"du":du,"tp1":t1,"tp2":t2,"sl":sh,"fh":fh,"cur":float(df["c"].iloc[-1]),"slp":slp,"tp1p":tp1p,"tp2p":tp2p,"sl_t":sl_t,"tp1_t":tp1_t,"tp2_t":tp2_t}
+    return {"mu":mu,"md":md,"du":du,"tp1":t1,"tp2":t2,"sl":sh,"fh":fh,"slp":slp,"tp1p":tp1p,"tp2p":tp2p,"sl_t":sl_t,"tp1_t":tp1_t,"tp2_t":tp2_t}
 
 def SCN(s, m="SPOT"):
     try:
@@ -379,7 +367,7 @@ AGS = [
     ("Sentiment Analyst","You analyze sentiment. Reply JSON only with keys verdict (GREEDY or FEARFUL or NEUTRAL), score (-3 to 3), reason (one line)."),
     ("Indicator Analyst","You analyze indicators. Reply JSON only with keys verdict (BULLISH or BEARISH or NEUTRAL), score (-3 to 3), reason (one line)."),
     ("Bollinger Analyst","You analyze Bollinger Bands. Reply JSON only with keys verdict (UPPER_BREAK or LOWER_BREAK or SQUEEZE), score (-3 to 3), reason (one line)."),
-    ("ADX Analyst","You analyze ADX trend. Reply JSON only with keys verdict (STRONG_TREND or WEAK_TREND), score (-3 to 3), reason (one line)."),
+    ("ADX Analyst","You analyze ADX. Reply JSON only with keys verdict (STRONG_TREND or WEAK_TREND), score (-3 to 3), reason (one line)."),
     ("CVD Analyst","You analyze CVD. Reply JSON only with keys verdict (BUY_DOM or SELL_DOM), score (-3 to 3), reason (one line)."),
 ]
 
@@ -429,7 +417,6 @@ if st.session_state.alerts:
 
 T1, T2, T3, T4 = st.tabs(["Scanner", "Chart", "LLM Debate", "Trades"])
 
-# ========== T1: Scanner ==========
 with T1:
     st.markdown("### Multi-Coin Scanner")
     mkt = st.radio("Market", ["SPOT", "FUTURES"], horizontal=True, key="m1")
@@ -473,9 +460,8 @@ with T1:
         for _, r in sh.head(15).iterrows():
             st.markdown("<div class='sig sigS'><b>" + r["Sym"] + "</b> <span class='sell'>SHORT</span> Str <b>" + str(r["Str"]) + "</b><br><b>E:</b> $" + str(r["E"]) + " <b>SL:</b> $" + str(r["SL"]) + " <b>TP1:</b> $" + str(r["TP1"]) + " <b>TP2:</b> $" + str(r["TP2"]) + "<br>RSI " + str(r["RSI"]) + " Vol " + str(r["VR"]) + "x</div>", unsafe_allow_html=True)
 
-# ========== T2: Chart ==========
 with T2:
-    st.markdown("### Chart + Indicators + Signal History")
+    st.markdown("### Chart + Signal History")
     mkt5 = st.radio("Market", ["SPOT", "FUTURES"], horizontal=True, key="m5")
     mid5 = "SPOT" if mkt5 == "SPOT" else "SWAP"
     al = COINS(mid5)
@@ -484,60 +470,73 @@ with T2:
     iv5 = c2.selectbox("TF", ["15m","1h","4h","1d"], index=1, key="t5")
     df5 = KL(s5, iv5, 300, mid5)
     if df5.empty or len(df5) < 30:
-        st.error("Data nahi mila")
+        st.error("Is coin ka data nahi mila. Dusra coin try karo.")
     else:
-        df5 = IND(df5)
-        sp, rs = ZN(df5)
-        sg = SG(df5)
-        la = df5.iloc[-1]
-        lpx = float(la["c"])
-        xs = [str(t) for t in df5["t"].tolist()]
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.62,0.16,0.22], subplot_titles=("","Vol","RSI"))
-        fig.add_trace(go.Candlestick(x=xs, open=[float(x) for x in df5["o"]], high=[float(x) for x in df5["h"]], low=[float(x) for x in df5["l"]], close=[float(x) for x in df5["c"]], name=s5, increasing_line_color="#22c55e", decreasing_line_color="#ef4444"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=[float(x) for x in df5["e20"]], line=dict(color="#22d3ee", width=1.5), name="EMA20"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=[float(x) for x in df5["e50"]], line=dict(color="#fbbf24", width=1.5), name="EMA50"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=[float(x) for x in df5["bbu"]], line=dict(color="#a855f7", width=1, dash="dot"), name="BB Up"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=[float(x) for x in df5["bbl"]], line=dict(color="#a855f7", width=1, dash="dot"), name="BB Lo"), row=1, col=1)
-        for p in rs:
-            fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#ef4444", opacity=0.15, line_width=0, row=1, col=1)
-        for p in sp:
-            fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#22c55e", opacity=0.15, line_width=0, row=1, col=1)
-        for x in sg:
-            cl2 = "#22c55e" if x["ty"] == "BUY" else "#ef4444"
-            yp = x["p"]*0.995 if x["ty"] == "BUY" else x["p"]*1.005
-            fig.add_trace(go.Scatter(x=[str(x["t"])], y=[float(yp)], mode="markers", marker=dict(symbol="triangle-up" if x["ty"] == "BUY" else "triangle-down", size=14, color=cl2), showlegend=False), row=1, col=1)
-        vc = ["#22c55e" if c >= o else "#ef4444" for c, o in zip([float(x) for x in df5["c"]], [float(x) for x in df5["o"]])]
-        fig.add_trace(go.Bar(x=xs, y=[float(x) for x in df5["v"]], marker_color=vc, name="Vol"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=xs, y=[float(x) for x in df5["rsi"]], line=dict(color="#a78bfa", width=1.5), name="RSI"), row=3, col=1)
-        fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", row=3, col=1)
-        fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", row=3, col=1)
-        fig.update_layout(template="plotly_dark", height=750, paper_bgcolor="#0b0f17", plot_bgcolor="#0b0f17", xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02), title=mkt5 + " " + s5 + " " + iv5)
-        fig.update_xaxes(showgrid=True, gridcolor="#1f2937")
-        fig.update_yaxes(showgrid=True, gridcolor="#1f2937")
-        st.plotly_chart(fig, use_container_width=True)
+        try:
+            df5 = IND(df5)
+            df5 = df5.dropna(subset=["o","h","l","c","e20","e50","rsi"])
+            if len(df5) < 10:
+                st.error("Not enough clean data")
+            else:
+                sp, rs = ZN(df5)
+                sg = SG(df5)
+                la = df5.iloc[-1]
+                lpx = float(la["c"])
+                xs = [x.strftime("%Y-%m-%d %H:%M") for x in df5["t"].tolist()]
+                opens = df5["o"].astype(float).tolist()
+                highs = df5["h"].astype(float).tolist()
+                lows = df5["l"].astype(float).tolist()
+                closes = df5["c"].astype(float).tolist()
+                vols = df5["v"].astype(float).tolist()
+                e20s = df5["e20"].astype(float).tolist()
+                e50s = df5["e50"].astype(float).tolist()
+                rsis = df5["rsi"].astype(float).tolist()
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.62,0.16,0.22], subplot_titles=("","Vol","RSI"))
+                fig.add_trace(go.Candlestick(x=xs, open=opens, high=highs, low=lows, close=closes, name=s5, increasing_line_color="#22c55e", decreasing_line_color="#ef4444"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=xs, y=e20s, line=dict(color="#22d3ee", width=1.5), name="EMA20"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=xs, y=e50s, line=dict(color="#fbbf24", width=1.5), name="EMA50"), row=1, col=1)
+                for p in rs:
+                    fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#ef4444", opacity=0.15, line_width=0, row=1, col=1)
+                for p in sp:
+                    fig.add_hrect(y0=p*0.997, y1=p*1.003, fillcolor="#22c55e", opacity=0.15, line_width=0, row=1, col=1)
+                for x in sg:
+                    cl2 = "#22c55e" if x["ty"] == "BUY" else "#ef4444"
+                    yp = x["p"]*0.995 if x["ty"] == "BUY" else x["p"]*1.005
+                    fig.add_trace(go.Scatter(x=[x["t"].strftime("%Y-%m-%d %H:%M")], y=[float(yp)], mode="markers", marker=dict(symbol="triangle-up" if x["ty"] == "BUY" else "triangle-down", size=14, color=cl2), showlegend=False), row=1, col=1)
+                vc = ["#22c55e" if c >= o else "#ef4444" for c, o in zip(closes, opens)]
+                fig.add_trace(go.Bar(x=xs, y=vols, marker_color=vc, name="Vol"), row=2, col=1)
+                fig.add_trace(go.Scatter(x=xs, y=rsis, line=dict(color="#a78bfa", width=1.5), name="RSI"), row=3, col=1)
+                fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", row=3, col=1)
+                fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", row=3, col=1)
+                fig.update_layout(template="plotly_dark", height=750, paper_bgcolor="#0b0f17", plot_bgcolor="#0b0f17", xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02), title=mkt5 + " " + s5 + " " + iv5)
+                fig.update_xaxes(showgrid=True, gridcolor="#1f2937")
+                fig.update_yaxes(showgrid=True, gridcolor="#1f2937")
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("#### Indicators")
+                st.markdown("<div class='card'><b>RSI:</b> " + str(round(float(la["rsi"]),2)) + " | <b>MACD:</b> " + str(round(float(la["macd"]),6)) + " | <b>ADX:</b> " + str(round(float(la["adx"]),2)) + " | <b>Stoch:</b> " + str(round(float(la["sk"]),2)) + " | <b>WR:</b> " + str(round(float(la["wr"]),2)) + " | <b>VWAP:</b> $" + str(round(float(la["vwap"]),6)) + " | <b>VolRatio:</b> " + str(round(float(la["vr"]),2)) + "x</div>", unsafe_allow_html=True)
+                if sg:
+                    st.markdown("### Signal History (PKT)")
+                    for s in sg[-8:][::-1]:
+                        try:
+                            at = float(df5["atr"].iloc[s["i"]]) if not pd.isna(df5["atr"].iloc[s["i"]]) else s["p"]*0.01
+                            tr = TRK(df5, s, at)
+                            sig_t = (s["t"] + timedelta(hours=5)).strftime("%Y-%m-%d %I:%M %p")
+                            mv = (lpx - s["p"])/s["p"]*100 if s["ty"] == "BUY" else (s["p"] - lpx)/s["p"]*100
+                            mc = "#22c55e" if mv > 0 else "#ef4444" if mv < 0 else "#f59e0b"
+                            sl_t = (tr["sl_t"] + timedelta(hours=5)).strftime("%m-%d %I:%M %p") if tr["sl_t"] is not None else "-"
+                            t1t = (tr["tp1_t"] + timedelta(hours=5)).strftime("%m-%d %I:%M %p") if tr["tp1_t"] is not None else "-"
+                            t2t = (tr["tp2_t"] + timedelta(hours=5)).strftime("%m-%d %I:%M %p") if tr["tp2_t"] is not None else "-"
+                            stat = "TP2 HIT" if tr["tp2"] else "TP1 HIT" if tr["tp1"] else "SL HIT" if tr["sl"] else "RUNNING"
+                            scc = "#22c55e" if tr["tp1"] or tr["tp2"] else "#ef4444" if tr["sl"] else "#f59e0b"
+                            bw = min(abs(mv)*5, 100)
+                            st.markdown("<div class='card' style='border-left:5px solid " + mc + "'><b>" + s["ty"] + "</b> @ $" + str(round(s["p"],6)) + " - Signal at <b>" + sig_t + " PKT</b><br>Now: $" + str(round(lpx,6)) + " | Move: <span style='color:" + mc + ";font-weight:900'>" + "{:+.2f}%".format(mv) + "</span> | Dur: " + "{:.1f}h".format(tr["du"]) + "<br><b>SL:</b> $" + str(round(tr["slp"],6)) + " <b>TP1:</b> $" + str(round(tr["tp1p"],6)) + " <b>TP2:</b> $" + str(round(tr["tp2p"],6)) + "<br>SL Hit: " + sl_t + " | TP1: " + t1t + " | TP2: " + t2t + "<br><b>Status:</b> <span style='color:" + scc + ";font-weight:900'>" + stat + "</span><div class='prog'><div style='width:" + str(bw) + "%;background:" + mc + "'></div></div></div>", unsafe_allow_html=True)
+                        except:
+                            continue
+        except Exception as ec:
+            st.warning("Chart error: " + str(ec)[:150])
 
-        st.markdown("#### Indicators")
-        st.markdown("<div class='card'><b>RSI:</b> " + str(round(float(la["rsi"]),2)) + " | <b>MACD:</b> " + str(round(float(la["macd"]),6)) + " | <b>ADX:</b> " + str(round(float(la["adx"]),2)) + " | <b>Stoch:</b> " + str(round(float(la["sk"]),2)) + " | <b>WR:</b> " + str(round(float(la["wr"]),2)) + " | <b>VWAP:</b> $" + str(round(float(la["vwap"]),6)) + " | <b>VolRatio:</b> " + str(round(float(la["vr"]),2)) + "x | <b>CVD:</b> " + str(round(float(la["cvd"]),0)) + "</div>", unsafe_allow_html=True)
-
-        if sg:
-            st.markdown("### Signal History (PKT)")
-            for s in sg[-8:][::-1]:
-                at = float(df5["atr"].iloc[s["i"]]) if not pd.isna(df5["atr"].iloc[s["i"]]) else s["p"]*0.01
-                tr = TRK(df5, s, at)
-                sig_t = (s["t"] + timedelta(hours=5)).strftime("%Y-%m-%d %I:%M %p")
-                mv = (lpx - s["p"])/s["p"]*100 if s["ty"] == "BUY" else (s["p"] - lpx)/s["p"]*100
-                mc = "#22c55e" if mv > 0 else "#ef4444" if mv < 0 else "#f59e0b"
-                sl_t = (tr["sl_t"] + timedelta(hours=5)).strftime("%m-%d %I:%M %p") if tr["sl_t"] is not None else "-"
-                t1t = (tr["tp1_t"] + timedelta(hours=5)).strftime("%m-%d %I:%M %p") if tr["tp1_t"] is not None else "-"
-                t2t = (tr["tp2_t"] + timedelta(hours=5)).strftime("%m-%d %I:%M %p") if tr["tp2_t"] is not None else "-"
-                stat = "TP2 HIT" if tr["tp2"] else "TP1 HIT" if tr["tp1"] else "SL HIT" if tr["sl"] else "RUNNING"
-                scc = "#22c55e" if tr["tp1"] or tr["tp2"] else "#ef4444" if tr["sl"] else "#f59e0b"
-                bw = min(abs(mv)*5, 100)
-                st.markdown("<div class='card' style='border-left:5px solid " + mc + "'><b>" + s["ty"] + "</b> @ $" + str(round(s["p"],6)) + " - Signal at <b>" + sig_t + " PKT</b><br>Now: $" + str(round(lpx,6)) + " | Move: <span style='color:" + mc + ";font-weight:900'>" + "{:+.2f}%".format(mv) + "</span> | Dur: " + "{:.1f}h".format(tr["du"]) + "<br><b>SL:</b> $" + str(round(tr["slp"],6)) + " <b>TP1:</b> $" + str(round(tr["tp1p"],6)) + " <b>TP2:</b> $" + str(round(tr["tp2p"],6)) + "<br>SL Hit: " + sl_t + " | TP1: " + t1t + " | TP2: " + t2t + "<br><b>Status:</b> <span style='color:" + scc + ";font-weight:900'>" + stat + "</span><div class='prog'><div style='width:" + str(bw) + "%;background:" + mc + "'></div></div></div>", unsafe_allow_html=True)
-
-# ========== T3: LLM Debate ==========
 with T3:
-    st.markdown("### LLM Debate - " + str(len(AGS)) + " Agents")
+    st.markdown("### LLM Debate")
     if not GK:
         st.warning("Add Groq key")
     else:
@@ -552,67 +551,69 @@ with T3:
             if df.empty:
                 st.error("No data")
             else:
-                df = IND(df)
-                la = df.iloc[-1]
-                nt = "Symbol: " + ls + " " + mkt + "\n"
-                nt += "Price: " + str(round(float(la["c"]),6)) + "\n"
-                nt += "EMA20: " + str(round(float(la["e20"]),6)) + "\n"
-                nt += "EMA50: " + str(round(float(la["e50"]),6)) + "\n"
-                nt += "RSI: " + str(round(float(la["rsi"]),2)) + "\n"
-                nt += "MACD Hist: " + str(round(float(la["mhist"]),6)) + "\n"
-                nt += "ATR: " + str(round(float(la["atr"]),6)) + "\n"
-                nt += "ADX: " + str(round(float(la["adx"]),2)) + "\n"
-                nt += "VolRatio: " + str(round(float(la["vr"]),2)) + "\n"
-                nt += "CVD: " + str(round(float(la["cvd"]),0)) + "\n"
-                nt += "Fear Greed: " + str(f["v"]) + " " + f["l"] + "\n"
-                nt += "BTC Dom: " + str(g["btc"]) + "%"
-                with st.spinner("Round 1..."):
-                    res1 = []
-                    for nm, sp_ in AGS:
-                        rr, ee = LLM(sp_, nt, 150)
-                        if ee:
-                            res1.append({"n":nm,"v":"ERR","s":0,"r":ee[:40]})
-                        else:
-                            d = PJ(rr)
-                            if d:
-                                res1.append({"n":nm,"v":d.get("verdict","?"),"s":int(d.get("score",0)),"r":d.get("reason","")})
+                try:
+                    df = IND(df)
+                    la = df.iloc[-1]
+                    nt = "Symbol: " + ls + " " + mkt + "\n"
+                    nt += "Price: " + str(round(float(la["c"]),6)) + "\n"
+                    nt += "EMA20: " + str(round(float(la["e20"]),6)) + "\n"
+                    nt += "EMA50: " + str(round(float(la["e50"]),6)) + "\n"
+                    nt += "RSI: " + str(round(float(la["rsi"]),2)) + "\n"
+                    nt += "MACD Hist: " + str(round(float(la["mhist"]),6)) + "\n"
+                    nt += "ATR: " + str(round(float(la["atr"]),6)) + "\n"
+                    nt += "ADX: " + str(round(float(la["adx"]),2)) + "\n"
+                    nt += "VolRatio: " + str(round(float(la["vr"]),2)) + "\n"
+                    nt += "CVD: " + str(round(float(la["cvd"]),0)) + "\n"
+                    nt += "Fear Greed: " + str(f["v"]) + " " + f["l"] + "\n"
+                    nt += "BTC Dom: " + str(g["btc"]) + "%"
+                    with st.spinner("Round 1..."):
+                        res1 = []
+                        for nm, sp_ in AGS:
+                            rr, ee = LLM(sp_, nt, 150)
+                            if ee:
+                                res1.append({"n":nm,"v":"ERR","s":0,"r":ee[:40]})
                             else:
-                                res1.append({"n":nm,"v":"?","s":0,"r":(rr or "")[:40]})
-                st.markdown("#### Round 1")
-                for a in res1:
-                    vc = "#22c55e" if a["s"] > 0 else "#ef4444" if a["s"] < 0 else "#f59e0b"
-                    st.markdown("<div class='llm' style='border-left-color:" + vc + "'><b>" + a["n"] + "</b> -> <b style='color:" + vc + "'>" + str(a["v"]) + "</b> (" + str(a["s"]) + ")<br>" + str(a["r"]) + "</div>", unsafe_allow_html=True)
-                sm = "Round 1:\n"
-                for a in res1: sm += a["n"] + ": " + str(a["v"]) + "\n"
-                with st.spinner("Round 2 Senior..."):
-                    sy = "You are senior strategist. Reply JSON only with keys verdict (BULLISH or BEARISH or NEUTRAL), score (-3 to 3), reason (one line)."
-                    rr, ee = LLM(sy, nt + "\n\n" + sm, 150)
-                    d2 = PJ(rr) if not ee else None
-                    v2 = d2.get("verdict","?") if d2 else "?"
-                    s2_ = int(d2.get("score",0)) if d2 else 0
-                    r2_ = d2.get("reason","") if d2 else ""
-                    vc = "#22c55e" if s2_ > 0 else "#ef4444" if s2_ < 0 else "#f59e0b"
-                    st.markdown("#### Round 2 Senior")
-                    st.markdown("<div class='llm' style='border-left-color:" + vc + "'><b>Senior</b> -> <b style='color:" + vc + "'>" + v2 + "</b> (" + str(s2_) + ")<br>" + r2_ + "</div>", unsafe_allow_html=True)
-                with st.spinner("Round 3 Chief..."):
-                    sm2 = sm + "\nSenior: " + v2 + " (" + str(s2_) + ")"
-                    sy3 = "You are Chief. Reply JSON only with keys decision (BUY or SELL or HOLD), market_type (SPOT or FUTURES), confidence (0-100), entry, sl, tp1, tp2, tp3, reasoning (2 lines)."
-                    rr, ee = LLM(sy3, nt + "\n\n" + sm2 + "\n\nFinal.", 300)
-                    if ee:
-                        st.error(ee)
-                    else:
-                        d3 = PJ(rr)
-                        if d3:
-                            dec = d3.get("decision","HOLD")
-                            mt = d3.get("market_type", mkt)
-                            cf = d3.get("confidence",0)
-                            dc = "#22c55e" if dec == "BUY" else "#ef4444" if dec == "SELL" else "#f59e0b"
-                            st.markdown("#### Round 3 Chief FINAL")
-                            st.markdown("<div class='card' style='border:3px solid " + dc + ";text-align:center'><div style='color:#94a3b8'>" + mt + " - " + PKT() + "</div><div style='color:" + dc + ";font-size:34px;font-weight:900'>" + str(dec) + "</div><div>Conf: " + str(cf) + "%</div><div style='margin-top:10px'><b>E:</b> $" + str(d3.get("entry","-")) + " <b>SL:</b> $" + str(d3.get("sl","-")) + " <b>TP1:</b> $" + str(d3.get("tp1","-")) + "</div><div style='margin-top:8px;font-style:italic'>" + str(d3.get("reasoning","")) + "</div></div>", unsafe_allow_html=True)
-                            st.session_state.trades.append({"time":PKT(),"full":PKTDT(),"coin":ls,"market":mt,"side":dec,"entry":d3.get("entry"),"sl":d3.get("sl"),"tp1":d3.get("tp1"),"tp2":d3.get("tp2")})
-                            if voice_on: V("LLM says " + dec + " confidence " + str(cf))
+                                d = PJ(rr)
+                                if d:
+                                    res1.append({"n":nm,"v":d.get("verdict","?"),"s":int(d.get("score",0)),"r":d.get("reason","")})
+                                else:
+                                    res1.append({"n":nm,"v":"?","s":0,"r":(rr or "")[:40]})
+                    st.markdown("#### Round 1")
+                    for a in res1:
+                        vc = "#22c55e" if a["s"] > 0 else "#ef4444" if a["s"] < 0 else "#f59e0b"
+                        st.markdown("<div class='llm' style='border-left-color:" + vc + "'><b>" + a["n"] + "</b> -> <b style='color:" + vc + "'>" + str(a["v"]) + "</b> (" + str(a["s"]) + ")<br>" + str(a["r"]) + "</div>", unsafe_allow_html=True)
+                    sm = "Round 1:\n"
+                    for a in res1: sm += a["n"] + ": " + str(a["v"]) + "\n"
+                    with st.spinner("Round 2 Senior..."):
+                        sy = "You are senior strategist. Reply JSON only with keys verdict (BULLISH or BEARISH or NEUTRAL), score (-3 to 3), reason (one line)."
+                        rr, ee = LLM(sy, nt + "\n\n" + sm, 150)
+                        d2 = PJ(rr) if not ee else None
+                        v2 = d2.get("verdict","?") if d2 else "?"
+                        s2_ = int(d2.get("score",0)) if d2 else 0
+                        r2_ = d2.get("reason","") if d2 else ""
+                        vc = "#22c55e" if s2_ > 0 else "#ef4444" if s2_ < 0 else "#f59e0b"
+                        st.markdown("#### Round 2 Senior")
+                        st.markdown("<div class='llm' style='border-left-color:" + vc + "'><b>Senior</b> -> <b style='color:" + vc + "'>" + v2 + "</b> (" + str(s2_) + ")<br>" + r2_ + "</div>", unsafe_allow_html=True)
+                    with st.spinner("Round 3 Chief..."):
+                        sm2 = sm + "\nSenior: " + v2 + " (" + str(s2_) + ")"
+                        sy3 = "You are Chief. Reply JSON only with keys decision (BUY or SELL or HOLD), market_type (SPOT or FUTURES), confidence (0-100), entry, sl, tp1, tp2, tp3, reasoning (2 lines)."
+                        rr, ee = LLM(sy3, nt + "\n\n" + sm2 + "\n\nFinal.", 300)
+                        if ee:
+                            st.error(ee)
+                        else:
+                            d3 = PJ(rr)
+                            if d3:
+                                dec = d3.get("decision","HOLD")
+                                mt = d3.get("market_type", mkt)
+                                cf = d3.get("confidence",0)
+                                dc = "#22c55e" if dec == "BUY" else "#ef4444" if dec == "SELL" else "#f59e0b"
+                                st.markdown("#### Round 3 Chief FINAL")
+                                st.markdown("<div class='card' style='border:3px solid " + dc + ";text-align:center'><div style='color:#94a3b8'>" + mt + " - " + PKT() + "</div><div style='color:" + dc + ";font-size:34px;font-weight:900'>" + str(dec) + "</div><div>Conf: " + str(cf) + "%</div><div style='margin-top:10px'><b>E:</b> $" + str(d3.get("entry","-")) + " <b>SL:</b> $" + str(d3.get("sl","-")) + " <b>TP1:</b> $" + str(d3.get("tp1","-")) + "</div><div style='margin-top:8px;font-style:italic'>" + str(d3.get("reasoning","")) + "</div></div>", unsafe_allow_html=True)
+                                st.session_state.trades.append({"time":PKT(),"full":PKTDT(),"coin":ls,"market":mt,"side":dec,"entry":d3.get("entry"),"sl":d3.get("sl"),"tp1":d3.get("tp1"),"tp2":d3.get("tp2")})
+                                if voice_on: V("LLM says " + dec + " confidence " + str(cf))
+                except Exception as e3:
+                    st.warning("LLM error: " + str(e3)[:150])
 
-# ========== T4: Trades ==========
 with T4:
     st.markdown("### Trades - Live Tracking")
     if st.session_state.trades:
