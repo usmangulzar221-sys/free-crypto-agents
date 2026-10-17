@@ -1,6 +1,6 @@
-streamlit
-requests
-pandas
-numpy
-plotly
-groq
+streamlit==1.28.0
+yfinance==0.2.33
+pandas==2.0.3
+plotly==5.18.0
+requests==2.31.0
+numpy==1.24.3
