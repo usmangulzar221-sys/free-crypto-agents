@@ -1,29 +1,30 @@
 import streamlit as st, requests, pandas as pd, numpy as np
 import plotly.graph_objects as go
 import json, os
-from datetime import datetime, timedelta
+from datetime import datetime
 from groq import Groq
 
-st.set_page_config(page_title="Auto LLM Scanner", layout="wide")
-st.markdown("<style>.stApp{background:#0b0f17;color:#e5e7eb}.card{background:#111827;padding:12px;border-radius:10px;margin:8px 0;border-left:5px solid #3b82f6}.buy{border-left-color:#22c55e}.sell{border-left-color:#ef4444}.win{border-left-color:#22c55e}.loss{border-left-color:#ef4444}</style>", unsafe_allow_html=True)
+st.set_page_config(page_title="Pro Scanner", layout="wide")
+st.markdown("<style>.stApp{background:#0b0f17;color:#e5e7eb}.card{background:#111827;padding:12px;border-radius:10px;margin:8px 0;border-left:5px solid #3b82f6}.win{border-left-color:#22c55e}.loss{border-left-color:#ef4444}.wait{border-left-color:#f59e0b}</style>", unsafe_allow_html=True)
 
-# --- Setup ---
+# --- Setup API Keys ---
 GK = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else os.environ.get("GROQ_API_KEY", "")
 if not GK:
     GK = st.sidebar.text_input("Groq API Key", type="password")
 cl = Groq(api_key=GK) if GK else None
 
+# --- Session State ---
+if "signals" not in st.session_state: st.session_state.signals = []
+
+# --- Data Fetching ---
 OK = "https://www.okx.com/api/v5"
 
-if "signals" not in st.session_state:
-    st.session_state.signals = []
-
-# --- Data Functions ---
 @st.cache_data(ttl=300)
-def get_coins():
+def get_top_coins():
     try:
         r = requests.get(f"{OK}/market/tickers?instType=SPOT").json()
-        return [d["instId"].replace("-","") for d in r["data"] if d["instId"].endswith("-USDT") and float(d.get("volCcy24h",0))>2000000][:30]
+        coins = [d["instId"].replace("-","") for d in r["data"] if d["instId"].endswith("-USDT") and float(d.get("volCcy24h",0))>3000000]
+        return coins[:20] # Top 20 high volume
     except: return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 @st.cache_data(ttl=60)
@@ -37,7 +38,7 @@ def get_klines(sym):
         return df.sort_values("t").reset_index(drop=True)
     except: return pd.DataFrame()
 
-def get_price(sym):
+def get_live_price(sym):
     try:
         r = requests.get(f"{OK}/market/ticker?instId={sym[:-4]}-USDT").json()
         return float(r["data"][0]["last"]) if r.get("code")=="0" else 0
@@ -45,7 +46,6 @@ def get_price(sym):
 
 # --- Indicators ---
 def calc_ind(df):
-    df = df.copy()
     df["e20"] = df["c"].ewm(span=20).mean()
     df["e50"] = df["c"].ewm(span=50).mean()
     delta = df["c"].diff()
@@ -57,145 +57,121 @@ def calc_ind(df):
     df["vol_ratio"] = df["v"] / df["v"].rolling(20).mean()
     return df
 
-# --- LLM Check ---
-def llm_decide(sym, price, rsi, ema_trend, vol):
+# --- LLM Brain ---
+def ask_llm(sym, price, rsi, trend, vol):
     if not cl: return "HOLD", "No API Key"
-    prompt = f"Coin: {sym}, Price: {price}, RSI: {rsi:.1f}, Trend: {ema_trend}, VolRatio: {vol:.2f}. Reply JSON: {{\"decision\": \"BUY|SELL|HOLD\", \"confidence\": 1-100, \"reason\": \"1 line\"}}"
+    prompt = f"Act as pro trader. Coin: {sym}, Price: {price}, RSI: {rsi:.1f}, Trend: {trend}, VolRatio: {vol:.2f}. Technicals are good for {trend}. Reply strictly JSON: {{\"decision\": \"BUY\" or \"SELL\" or \"HOLD\", \"reason\": \"short reason\"}}"
     try:
         res = cl.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.2,
             response_format={"type": "json_object"}
         )
         d = json.loads(res.choices[0].message.content)
         return d.get("decision", "HOLD"), d.get("reason", "")
-    except: return "HOLD", "LLM Error"
+    except Exception as e:
+        return "HOLD", f"LLM Error: {e}"
 
 # --- UI ---
-st.title("🤖 Auto LLM Scanner & Tracker")
+st.title("🎯 AI Auto-Scanner & Signal Tracker")
 
-# Tabs
-tab1, tab2 = st.tabs(["🔍 Auto Scanner", "📊 Signal Tracker (Backtest)"])
+tab_scan, tab_track = st.tabs(["🔍 Auto Scan & Signal", "📊 Signal History (SL/TP Tracker)"])
 
-# --- Tab 1: Auto Scanner ---
-with tab1:
-    st.write("Click the button below. Scanner will auto-select top coins, find the best technical signal, and ask LLM for final confirmation.")
+# ================= TAB 1: SCANNER =================
+with tab_scan:
+    st.write("Scan top coins, find technical setups, and let AI verify the final signal.")
     
-    if st.button("🚀 Run Auto Scan & LLM Decide", type="primary", use_container_width=True):
-        if not cl: st.error("Please add Groq API Key in sidebar.")
+    if st.button("🚀 Start Auto Scan", type="primary", use_container_width=True):
+        if not cl: st.error("Please enter Groq Key in sidebar.")
         else:
-            with st.spinner("Scanning markets..."):
-                coins = get_coins()
-                best_signal = None
+            with st.spinner("Scanning top 20 coins..."):
+                coins = get_top_coins()
+                best_setup = None
                 max_score = 0
                 
-                # 1. Find Best Technical Signal
                 for sym in coins:
                     df = get_klines(sym)
                     if len(df) < 50: continue
                     df = calc_ind(df)
                     last = df.iloc[-1]
                     
-                    trend = "BULL" if last["e20"] > last["e50"] else "BEAR"
-                    rsi, vol, atr, px = last["rsi"], last["vol_ratio"], last["atr"], last["c"]
+                    trend = "BUY" if last["e20"] > last["e50"] else "SELL"
+                    rsi, vol = last["rsi"], last["vol_ratio"]
                     
-                    # Scoring
+                    # Tech Score
                     score = 0
-                    if trend == "BULL" and 40 < rsi < 65: score += 40
-                    if trend == "BEAR" and 35 < rsi < 60: score += 40
-                    if vol > 1.5: score += 30
+                    if trend == "BUY" and 45 < rsi < 65: score += 40
+                    if trend == "SELL" and 35 < rsi < 55: score += 40
+                    if vol > 1.2: score += 30
                     
                     if score > max_score:
                         max_score = score
-                        best_signal = {"sym": sym, "trend": trend, "rsi": rsi, "vol": vol, "atr": atr, "price": px}
+                        best_setup = {"sym": sym, "type": trend, "rsi": rsi, "vol": vol, "atr": last["atr"], "price": last["c"]}
                 
-                # 2. Ask LLM to confirm the best one
-                if best_signal:
-                    st.info(f"🎯 Top Technical Signal: **{best_signal['sym']}** (Score: {max_score})")
-                    
-                    with st.spinner("Asking LLM for final decision..."):
-                        decision, reason = llm_decide(best_signal["sym"], best_signal["price"], best_signal["rsi"], best_signal["trend"], best_signal["vol"])
+                if best_setup:
+                    st.info(f"Top Technical Match: **{best_setup['sym']}** (Score: {max_score})")
+                    with st.spinner("AI is verifying..."):
+                        decision, reason = ask_llm(best_setup["sym"], best_setup["price"], best_setup["rsi"], best_setup["type"], best_setup["vol"])
                         
                         if decision in ["BUY", "SELL"]:
-                            entry = best_signal["price"]
-                            atr = best_signal["atr"]
+                            entry = best_setup["price"]
+                            atr = best_setup["atr"]
+                            sl = entry - (1.5*atr) if decision=="BUY" else entry + (1.5*atr)
+                            tp = entry + (3.0*atr) if decision=="BUY" else entry - (3.0*atr)
                             
-                            if decision == "BUY":
-                                sl = entry - (1.5 * atr)
-                                tp = entry + (3.0 * atr)
-                            else:
-                                sl = entry + (1.5 * atr)
-                                tp = entry - (3.0 * atr)
-                                
-                            new_sig = {
+                            st.session_state.signals.append({
                                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "coin": best_signal["sym"],
+                                "coin": best_setup["sym"],
                                 "decision": decision,
-                                "entry": entry,
-                                "sl": sl,
-                                "tp": tp,
+                                "entry": entry, "sl": sl, "tp": tp,
                                 "status": "RUNNING"
-                            }
-                            st.session_state.signals.append(new_sig)
+                            })
                             
-                            cls = "buy" if decision == "BUY" else "sell"
-                            st.markdown(f"<div class='card {cls}'><h3>{decision} {best_signal['sym']}</h3><p><b>Reason:</b> {reason}</p><p><b>Entry:</b> ${entry:.4f} | <b>SL:</b> ${sl:.4f} | <b>TP:</b> ${tp:.4f}</p></div>", unsafe_allow_html=True)
+                            cls = "win" if decision=="BUY" else "loss"
+                            st.markdown(f"<div class='card {cls}'><h3>✅ {decision} {best_setup['sym']}</h3><p><b>AI Reason:</b> {reason}</p><p><b>Entry:</b> ${entry:.4f} | <b>SL:</b> ${sl:.4f} | <b>TP:</b> ${tp:.4f}</p></div>", unsafe_allow_html=True)
                         else:
-                            st.warning(f"LLM Decision: **{decision}**. Reason: {reason}")
+                            st.warning(f"AI Rejected: **{decision}**. Reason: {reason}. (Market conditions not perfect).")
                 else:
-                    st.warning("No strong technical signals found right now.")
+                    st.warning("No good technical setups found right now.")
 
-# --- Tab 2: Signal Tracker ---
-with tab2:
-    st.write("Track signals generated by the LLM. It checks live prices to see if SL/TP hit, and calculates duration.")
+# ================= TAB 2: TRACKER =================
+with tab_track:
+    st.write("Tracks open signals. Checks price live to see if TP or SL hit, and calculates duration.")
     
     if not st.session_state.signals:
-        st.info("No signals generated yet. Run the Auto Scanner first.")
+        st.info("No signals generated yet.")
     else:
-        # Update statuses
         for sig in st.session_state.signals:
             if sig["status"] == "RUNNING":
-                cur_px = get_price(sig["coin"])
+                cur_px = get_live_price(sig["coin"])
                 if cur_px > 0:
                     if sig["decision"] == "BUY":
-                        if cur_px >= sig["tp"]:
-                            sig["status"] = "WIN (TP HIT)"
-                            sig["hit_time"] = datetime.now()
-                        elif cur_px <= sig["sl"]:
-                            sig["status"] = "LOSS (SL HIT)"
-                            sig["hit_time"] = datetime.now()
+                        if cur_px >= sig["tp"]: sig["status"] = "WIN (TP)"; sig["hit_time"] = datetime.now()
+                        elif cur_px <= sig["sl"]: sig["status"] = "LOSS (SL)"; sig["hit_time"] = datetime.now()
                     elif sig["decision"] == "SELL":
-                        if cur_px <= sig["tp"]:
-                            sig["status"] = "WIN (TP HIT)"
-                            sig["hit_time"] = datetime.now()
-                        elif cur_px >= sig["sl"]:
-                            sig["status"] = "LOSS (SL HIT)"
-                            sig["hit_time"] = datetime.now()
+                        if cur_px <= sig["tp"]: sig["status"] = "WIN (TP)"; sig["hit_time"] = datetime.now()
+                        elif cur_px >= sig["sl"]: sig["status"] = "LOSS (SL)"; sig["hit_time"] = datetime.now()
 
-        # Display
         for sig in reversed(st.session_state.signals):
-            cur_px = get_price(sig["coin"])
+            cur_px = get_live_price(sig["coin"])
+            status_cls = "wait"
+            if "WIN" in sig["status"]: status_cls = "win"
+            elif "LOSS" in sig["status"]: status_cls = "loss"
             
-            status_color = "#f59e0b"
-            if "WIN" in sig["status"]: status_color = "#22c55e"
-            elif "LOSS" in sig["status"]: status_color = "#ef4444"
-            
-            time_html = f"<b>Signal Time:</b> {sig['time']}<br>"
+            time_html = f"<b>Signal Generated:</b> {sig['time']}<br>"
             
             if "hit_time" in sig:
                 t1 = datetime.strptime(sig["time"], "%Y-%m-%d %H:%M:%S")
-                t2 = sig["hit_time"]
-                diff = t2 - t1
-                hrs = diff.total_seconds() / 3600
-                time_html += f"<b>Result Time:</b> {t2.strftime('%Y-%m-%d %H:%M:%S')} (Took {hrs:.1f} hours)<br>"
+                hrs = (sig["hit_time"] - t1).total_seconds() / 3600
+                time_html += f"<b>Result Time:</b> {sig['hit_time'].strftime('%Y-%m-%d %H:%M:%S')} (After {hrs:.1f} hours)<br>"
             
             st.markdown(f"""
-            <div class='card' style='border-left-color:{status_color}'>
-                <h4 style='color:{status_color};margin:0;'>{sig['coin']} {sig['decision']} - {sig['status']}</h4>
+            <div class='card {status_cls}'>
+                <h4 style='margin:0;'>{sig['coin']} {sig['decision']} - {sig['status']}</h4>
                 {time_html}
                 <b>Entry:</b> ${sig['entry']:.4f} | <b>SL:</b> ${sig['sl']:.4f} | <b>TP:</b> ${sig['tp']:.4f}<br>
-                <b>Current Price:</b> ${cur_px:.4f}
+                <b>Live Price:</b> ${cur_px:.4f}
             </div>
             """, unsafe_allow_html=True)
             
