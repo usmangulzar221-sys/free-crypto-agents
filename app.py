@@ -1,96 +1,204 @@
-import streamlit as st
-import requests
-import pandas as pd
-import json
-import os
+import streamlit as st, requests, pandas as pd, numpy as np
+import plotly.graph_objects as go
+import json, os
+from datetime import datetime, timedelta
+from groq import Groq
 
-st.set_page_config(page_title="LLM Signal", layout="wide")
-st.title("🧠 Real LLM Signal Generator")
+st.set_page_config(page_title="Auto LLM Scanner", layout="wide")
+st.markdown("<style>.stApp{background:#0b0f17;color:#e5e7eb}.card{background:#111827;padding:12px;border-radius:10px;margin:8px 0;border-left:5px solid #3b82f6}.buy{border-left-color:#22c55e}.sell{border-left-color:#ef4444}.win{border-left-color:#22c55e}.loss{border-left-color:#ef4444}</style>", unsafe_allow_html=True)
 
-# --- Groq Setup ---
-try:
-    from groq import Groq
-    key = ""
-    try: key = st.secrets["GROQ_API_KEY"]
-    except: key = os.environ.get("GROQ_API_KEY", "")
-    client = Groq(api_key=key) if key else None
-except:
-    client = None
+# --- Setup ---
+GK = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else os.environ.get("GROQ_API_KEY", "")
+if not GK:
+    GK = st.sidebar.text_input("Groq API Key", type="password")
+cl = Groq(api_key=GK) if GK else None
 
-with st.sidebar:
-    if not key:
-        uk = st.text_input("Groq Key", type="password")
-        if uk: client = Groq(api_key=uk); st.success("Loaded")
-    else: st.success("Key Loaded")
-    coin = st.selectbox("Coin", ["BTC-USDT", "ETH-USDT", "SOL-USDT"])
-    tf = st.selectbox("TF", ["15m", "1H", "4H"], index=1)
+OK = "https://www.okx.com/api/v5"
 
-# --- Data + Indicators ---
-@st.cache_data(ttl=60)
-def get_data(sym, t):
+if "signals" not in st.session_state:
+    st.session_state.signals = []
+
+# --- Data Functions ---
+@st.cache_data(ttl=300)
+def get_coins():
     try:
-        r = requests.get(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar={t}&limit=100").json()
-        if r.get("code") != "0": return None
-        df = pd.DataFrame(r["data"], columns=["t","o","h","l","c","v","vq","vc","x"])
-        for col in ["o","h","l","c","v"]: df[col] = df[col].astype(float)
-        df = df.sort_values("t")
-        
-        df["ema20"] = df["c"].ewm(span=20).mean()
-        df["ema50"] = df["c"].ewm(span=50).mean()
-        delta = df["c"].diff()
-        gain = (delta.where(delta>0,0)).rolling(14).mean()
-        loss = (-delta.where(delta<0,0)).rolling(14).mean()
-        df["rsi"] = 100 - (100 / (1 + gain/loss))
-        tr = pd.concat([df["h"]-df["l"], (df["h"]-df["c"].shift()).abs(), (df["l"]-df["c"].shift()).abs()], axis=1).max(axis=1)
-        df["atr"] = tr.rolling(14).mean()
-        last = df.iloc[-1]
-        return {"price": last["c"], "rsi": last["rsi"], "ema20": last["ema20"], "ema50": last["ema50"], "atr": last["atr"], "vol": last["v"] / df["v"].rolling(20).mean().iloc[-1]}
-    except: return None
+        r = requests.get(f"{OK}/market/tickers?instType=SPOT").json()
+        return [d["instId"].replace("-","") for d in r["data"] if d["instId"].endswith("-USDT") and float(d.get("volCcy24h",0))>2000000][:30]
+    except: return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-# --- Main App ---
-if st.button("🚀 Generate Signal", type="primary", use_container_width=True):
-    if not client: st.error("Add Groq Key")
-    else:
-        with st.spinner("Fetching & Analyzing..."):
-            d = get_data(coin, tf)
-            if not d: st.error("Failed to fetch OKX data")
-            else:
-                c1,c2,c3,c4 = st.columns(4)
-                c1.metric("Price", f"${d['price']:,.4f}")
-                c2.metric("RSI", f"{d['rsi']:.1f}")
-                c3.metric("Trend", "Bull" if d['ema20']>d['ema50'] else "Bear")
-                c4.metric("Vol", f"{d['vol']:.2f}x")
-                st.divider()
+@st.cache_data(ttl=60)
+def get_klines(sym):
+    try:
+        r = requests.get(f"{OK}/market/candles?instId={sym[:-4]}-USDT&bar=1H&limit=100").json()
+        if r.get("code") != "0": return pd.DataFrame()
+        df = pd.DataFrame(r["data"], columns=["t","o","h","l","c","v","vq","vc","x"])
+        for c in ["o","h","l","c","v"]: df[c] = df[c].astype(float)
+        df["t"] = pd.to_datetime(df["t"].astype(float), unit="ms")
+        return df.sort_values("t").reset_index(drop=True)
+    except: return pd.DataFrame()
+
+def get_price(sym):
+    try:
+        r = requests.get(f"{OK}/market/ticker?instId={sym[:-4]}-USDT").json()
+        return float(r["data"][0]["last"]) if r.get("code")=="0" else 0
+    except: return 0
+
+# --- Indicators ---
+def calc_ind(df):
+    df = df.copy()
+    df["e20"] = df["c"].ewm(span=20).mean()
+    df["e50"] = df["c"].ewm(span=50).mean()
+    delta = df["c"].diff()
+    gain = (delta.where(delta>0,0)).rolling(14).mean()
+    loss = (-delta.where(delta<0,0)).rolling(14).mean()
+    df["rsi"] = 100 - (100 / (1 + gain/loss))
+    tr = pd.concat([df["h"]-df["l"], (df["h"]-df["c"].shift()).abs(), (df["l"]-df["c"].shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+    df["vol_ratio"] = df["v"] / df["v"].rolling(20).mean()
+    return df
+
+# --- LLM Check ---
+def llm_decide(sym, price, rsi, ema_trend, vol):
+    if not cl: return "HOLD", "No API Key"
+    prompt = f"Coin: {sym}, Price: {price}, RSI: {rsi:.1f}, Trend: {ema_trend}, VolRatio: {vol:.2f}. Reply JSON: {{\"decision\": \"BUY|SELL|HOLD\", \"confidence\": 1-100, \"reason\": \"1 line\"}}"
+    try:
+        res = cl.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        d = json.loads(res.choices[0].message.content)
+        return d.get("decision", "HOLD"), d.get("reason", "")
+    except: return "HOLD", "LLM Error"
+
+# --- UI ---
+st.title("🤖 Auto LLM Scanner & Tracker")
+
+# Tabs
+tab1, tab2 = st.tabs(["🔍 Auto Scanner", "📊 Signal Tracker (Backtest)"])
+
+# --- Tab 1: Auto Scanner ---
+with tab1:
+    st.write("Click the button below. Scanner will auto-select top coins, find the best technical signal, and ask LLM for final confirmation.")
+    
+    if st.button("🚀 Run Auto Scan & LLM Decide", type="primary", use_container_width=True):
+        if not cl: st.error("Please add Groq API Key in sidebar.")
+        else:
+            with st.spinner("Scanning markets..."):
+                coins = get_coins()
+                best_signal = None
+                max_score = 0
                 
-                prompt = f"Analyze {coin} {tf}. Price: {d['price']:.4f}, RSI: {d['rsi']:.1f}, EMA20: {d['ema20']:.4f}, EMA50: {d['ema50']:.4f}, VolRatio: {d['vol']:.2f}. Reply in JSON: {{\"decision\": \"BUY|SELL|HOLD\", \"confidence\": 1-100, \"reason\": \"1 line\"}}"
+                # 1. Find Best Technical Signal
+                for sym in coins:
+                    df = get_klines(sym)
+                    if len(df) < 50: continue
+                    df = calc_ind(df)
+                    last = df.iloc[-1]
+                    
+                    trend = "BULL" if last["e20"] > last["e50"] else "BEAR"
+                    rsi, vol, atr, px = last["rsi"], last["vol_ratio"], last["atr"], last["c"]
+                    
+                    # Scoring
+                    score = 0
+                    if trend == "BULL" and 40 < rsi < 65: score += 40
+                    if trend == "BEAR" and 35 < rsi < 60: score += 40
+                    if vol > 1.5: score += 30
+                    
+                    if score > max_score:
+                        max_score = score
+                        best_signal = {"sym": sym, "trend": trend, "rsi": rsi, "vol": vol, "atr": atr, "price": px}
                 
-                try:
-                    # Yahan naya model use ho raha hai
-                    res = client.chat.completions.create(
-                        model="openai/gpt-oss-120b",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                        response_format={"type": "json_object"}
-                    )
-                    result = json.loads(res.choices[0].message.content)
-                    dec, conf, reason = result.get("decision"), result.get("confidence"), result.get("reason")
+                # 2. Ask LLM to confirm the best one
+                if best_signal:
+                    st.info(f"🎯 Top Technical Signal: **{best_signal['sym']}** (Score: {max_score})")
                     
-                    if dec == "BUY": st.success(f"### 🟢 BUY ({conf}%)")
-                    elif dec == "SELL": st.error(f"### 🔴 SELL ({conf}%)")
-                    else: st.warning(f"### 🟡 HOLD ({conf}%)")
-                    st.info(f"**Reason:** {reason}")
-                    
-                    if dec in ["BUY", "SELL"]:
-                        st.subheader("🎯 Trade Setup (ATR Based)")
-                        entry, atr = d['price'], d['atr']
-                        sl = entry - 2*atr if dec=="BUY" else entry + 2*atr
-                        tp1 = entry + 2*atr if dec=="BUY" else entry - 2*atr
-                        tp2 = entry + 4*atr if dec=="BUY" else entry - 4*atr
+                    with st.spinner("Asking LLM for final decision..."):
+                        decision, reason = llm_decide(best_signal["sym"], best_signal["price"], best_signal["rsi"], best_signal["trend"], best_signal["vol"])
                         
-                        t1,t2,t3,t4 = st.columns(4)
-                        t1.metric("Entry", f"${entry:,.4f}")
-                        t2.metric("Stop Loss", f"${sl:,.4f}")
-                        t3.metric("TP1", f"${tp1:,.4f}")
-                        t4.metric("TP2", f"${tp2:,.4f}")
-                except Exception as e:
-                    st.error(f"LLM Error: {e}")
+                        if decision in ["BUY", "SELL"]:
+                            entry = best_signal["price"]
+                            atr = best_signal["atr"]
+                            
+                            if decision == "BUY":
+                                sl = entry - (1.5 * atr)
+                                tp = entry + (3.0 * atr)
+                            else:
+                                sl = entry + (1.5 * atr)
+                                tp = entry - (3.0 * atr)
+                                
+                            new_sig = {
+                                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "coin": best_signal["sym"],
+                                "decision": decision,
+                                "entry": entry,
+                                "sl": sl,
+                                "tp": tp,
+                                "status": "RUNNING"
+                            }
+                            st.session_state.signals.append(new_sig)
+                            
+                            cls = "buy" if decision == "BUY" else "sell"
+                            st.markdown(f"<div class='card {cls}'><h3>{decision} {best_signal['sym']}</h3><p><b>Reason:</b> {reason}</p><p><b>Entry:</b> ${entry:.4f} | <b>SL:</b> ${sl:.4f} | <b>TP:</b> ${tp:.4f}</p></div>", unsafe_allow_html=True)
+                        else:
+                            st.warning(f"LLM Decision: **{decision}**. Reason: {reason}")
+                else:
+                    st.warning("No strong technical signals found right now.")
+
+# --- Tab 2: Signal Tracker ---
+with tab2:
+    st.write("Track signals generated by the LLM. It checks live prices to see if SL/TP hit, and calculates duration.")
+    
+    if not st.session_state.signals:
+        st.info("No signals generated yet. Run the Auto Scanner first.")
+    else:
+        # Update statuses
+        for sig in st.session_state.signals:
+            if sig["status"] == "RUNNING":
+                cur_px = get_price(sig["coin"])
+                if cur_px > 0:
+                    if sig["decision"] == "BUY":
+                        if cur_px >= sig["tp"]:
+                            sig["status"] = "WIN (TP HIT)"
+                            sig["hit_time"] = datetime.now()
+                        elif cur_px <= sig["sl"]:
+                            sig["status"] = "LOSS (SL HIT)"
+                            sig["hit_time"] = datetime.now()
+                    elif sig["decision"] == "SELL":
+                        if cur_px <= sig["tp"]:
+                            sig["status"] = "WIN (TP HIT)"
+                            sig["hit_time"] = datetime.now()
+                        elif cur_px >= sig["sl"]:
+                            sig["status"] = "LOSS (SL HIT)"
+                            sig["hit_time"] = datetime.now()
+
+        # Display
+        for sig in reversed(st.session_state.signals):
+            cur_px = get_price(sig["coin"])
+            
+            status_color = "#f59e0b"
+            if "WIN" in sig["status"]: status_color = "#22c55e"
+            elif "LOSS" in sig["status"]: status_color = "#ef4444"
+            
+            time_html = f"<b>Signal Time:</b> {sig['time']}<br>"
+            
+            if "hit_time" in sig:
+                t1 = datetime.strptime(sig["time"], "%Y-%m-%d %H:%M:%S")
+                t2 = sig["hit_time"]
+                diff = t2 - t1
+                hrs = diff.total_seconds() / 3600
+                time_html += f"<b>Result Time:</b> {t2.strftime('%Y-%m-%d %H:%M:%S')} (Took {hrs:.1f} hours)<br>"
+            
+            st.markdown(f"""
+            <div class='card' style='border-left-color:{status_color}'>
+                <h4 style='color:{status_color};margin:0;'>{sig['coin']} {sig['decision']} - {sig['status']}</h4>
+                {time_html}
+                <b>Entry:</b> ${sig['entry']:.4f} | <b>SL:</b> ${sig['sl']:.4f} | <b>TP:</b> ${sig['tp']:.4f}<br>
+                <b>Current Price:</b> ${cur_px:.4f}
+            </div>
+            """, unsafe_allow_html=True)
+            
+        if st.button("Clear History"):
+            st.session_state.signals = []
+            st.rerun()
