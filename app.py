@@ -3,13 +3,11 @@ import requests
 import pandas as pd
 import json
 import os
-from datetime import datetime
 
-st.set_page_config(page_title="LLM Signal Generator", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="LLM Signal", layout="wide")
 st.title("🧠 Real LLM Signal Generator")
-st.write("Live OKX Data + Groq AI Analysis")
 
-# --- API Setup ---
+# --- Groq Setup ---
 try:
     from groq import Groq
     key = ""
@@ -20,146 +18,79 @@ except:
     client = None
 
 with st.sidebar:
-    st.header("Settings")
     if not key:
-        user_key = st.text_input("Enter Groq API Key", type="password")
-        if user_key:
-            client = Groq(api_key=user_key)
-            st.success("Key Loaded")
-    else:
-        st.success("Key Loaded")
-    
-    coin = st.selectbox("Select Coin", ["BTC-USDT", "ETH-USDT", "SOL-USDT", "DOGE-USDT", "XRP-USDT"])
-    tf = st.selectbox("Timeframe", ["15m", "1H", "4H"], index=1)
+        uk = st.text_input("Groq Key", type="password")
+        if uk: client = Groq(api_key=uk); st.success("Loaded")
+    else: st.success("Key Loaded")
+    coin = st.selectbox("Coin", ["BTC-USDT", "ETH-USDT", "SOL-USDT"])
+    tf = st.selectbox("TF", ["15m", "1H", "4H"], index=1)
 
-# --- Data Fetching ---
+# --- Data + Indicators ---
 @st.cache_data(ttl=60)
-def get_data(symbol, timeframe):
+def get_data(sym, t):
     try:
-        url = f"https://www.okx.com/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit=100"
-        r = requests.get(url).json()
+        r = requests.get(f"https://www.okx.com/api/v5/market/candles?instId={sym}&bar={t}&limit=100").json()
         if r.get("code") != "0": return None
-        
         df = pd.DataFrame(r["data"], columns=["t","o","h","l","c","v","vq","vc","x"])
-        for col in ["o","h","l","c","v"]:
-            df[col] = df[col].astype(float)
+        for col in ["o","h","l","c","v"]: df[col] = df[col].astype(float)
         df = df.sort_values("t")
         
-        # Indicators (Real Math)
         df["ema20"] = df["c"].ewm(span=20).mean()
         df["ema50"] = df["c"].ewm(span=50).mean()
-        
         delta = df["c"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df["rsi"] = 100 - (100 / (1 + rs))
-        
-        e1 = df["c"].ewm(span=12).mean()
-        e2 = df["c"].ewm(span=26).mean()
-        df["macd"] = e1 - e2
-        df["signal"] = df["macd"].ewm(span=9).mean()
-        
+        gain = (delta.where(delta>0,0)).rolling(14).mean()
+        loss = (-delta.where(delta<0,0)).rolling(14).mean()
+        df["rsi"] = 100 - (100 / (1 + gain/loss))
         tr = pd.concat([df["h"]-df["l"], (df["h"]-df["c"].shift()).abs(), (df["l"]-df["c"].shift()).abs()], axis=1).max(axis=1)
         df["atr"] = tr.rolling(14).mean()
-        
         last = df.iloc[-1]
-        return {
-            "price": last["c"],
-            "rsi": last["rsi"],
-            "ema20": last["ema20"],
-            "ema50": last["ema50"],
-            "macd": last["macd"],
-            "atr": last["atr"],
-            "vol_ratio": last["v"] / df["v"].rolling(20).mean().iloc[-1]
-        }
-    except Exception as e:
-        return None
+        return {"price": last["c"], "rsi": last["rsi"], "ema20": last["ema20"], "ema50": last["ema50"], "atr": last["atr"], "vol": last["v"] / df["v"].rolling(20).mean().iloc[-1]}
+    except: return None
 
-# --- Main Logic ---
-if st.button("🚀 Generate LLM Signal", type="primary", use_container_width=True):
-    if not client:
-        st.error("Please enter Groq API Key in sidebar!")
+# --- Main App ---
+if st.button("🚀 Generate Signal", type="primary", use_container_width=True):
+    if not client: st.error("Add Groq Key")
     else:
-        with st.spinner("Fetching live data & asking AI..."):
-            data = get_data(coin, tf)
-            
-            if not data:
-                st.error("Failed to fetch data from OKX.")
+        with st.spinner("Fetching & Analyzing..."):
+            d = get_data(coin, tf)
+            if not d: st.error("Failed to fetch OKX data")
             else:
-                # Show Real Data
-                st.subheader("📊 Real Market Data")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Price", f"${data['price']:,.4f}")
-                c2.metric("RSI", f"{data['rsi']:.1f}")
-                c3.metric("EMA Trend", "Bullish" if data['ema20'] > data['ema50'] else "Bearish")
-                c4.metric("Vol Ratio", f"{data['vol_ratio']:.2f}x")
-                
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Price", f"${d['price']:,.4f}")
+                c2.metric("RSI", f"{d['rsi']:.1f}")
+                c3.metric("Trend", "Bull" if d['ema20']>d['ema50'] else "Bear")
+                c4.metric("Vol", f"{d['vol']:.2f}x")
                 st.divider()
                 
-                # LLM Prompt
-                prompt = f"""
-                Analyze this crypto data for {coin} ({tf} timeframe):
-                - Current Price: {data['price']}
-                - RSI: {data['rsi']:.2f}
-                - EMA20: {data['ema20']:.2f}
-                - EMA50: {data['ema50']:.2f}
-                - MACD: {data['macd']:.4f}
-                - Volume Ratio: {data['vol_ratio']:.2f}x
-                
-                Based on this, should I BUY, SELL, or HOLD?
-                Reply ONLY in this JSON format: 
-                {{"decision": "BUY" or "SELL" or "HOLD", "confidence": 1-100, "reason": "1 line reasoning"}}
-                """
+                prompt = f"Analyze {coin} {tf}. Price: {d['price']:.4f}, RSI: {d['rsi']:.1f}, EMA20: {d['ema20']:.4f}, EMA50: {d['ema50']:.4f}, VolRatio: {d['vol']:.2f}. Reply in JSON: {{\"decision\": \"BUY|SELL|HOLD\", \"confidence\": 1-100, \"reason\": \"1 line\"}}"
                 
                 try:
-                    response = client.chat.completions.create(
-                        model="llama3-70b-8192", # Fast & Smart
+                    # Yahan naya model use ho raha hai
+                    res = client.chat.completions.create(
+                        model="openai/gpt-oss-120b",
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.1,
                         response_format={"type": "json_object"}
                     )
+                    result = json.loads(res.choices[0].message.content)
+                    dec, conf, reason = result.get("decision"), result.get("confidence"), result.get("reason")
                     
-                    raw_text = response.choices[0].message.content
-                    result = json.loads(raw_text)
+                    if dec == "BUY": st.success(f"### 🟢 BUY ({conf}%)")
+                    elif dec == "SELL": st.error(f"### 🔴 SELL ({conf}%)")
+                    else: st.warning(f"### 🟡 HOLD ({conf}%)")
+                    st.info(f"**Reason:** {reason}")
                     
-                    decision = result.get("decision", "HOLD")
-                    conf = result.get("confidence", 0)
-                    reason = result.get("reason", "No reason provided")
-                    
-                    # Display Result
-                    if decision == "BUY":
-                        st.success(f"### 🟢 Decision: {decision} (Confidence: {conf}%)")
-                    elif decision == "SELL":
-                        st.error(f"### 🔴 Decision: {decision} (Confidence: {conf}%)")
-                    else:
-                        st.warning(f"### 🟡 Decision: {decision} (Confidence: {conf}%)")
+                    if dec in ["BUY", "SELL"]:
+                        st.subheader("🎯 Trade Setup (ATR Based)")
+                        entry, atr = d['price'], d['atr']
+                        sl = entry - 2*atr if dec=="BUY" else entry + 2*atr
+                        tp1 = entry + 2*atr if dec=="BUY" else entry - 2*atr
+                        tp2 = entry + 4*atr if dec=="BUY" else entry - 4*atr
                         
-                    st.info(f"**AI Reasoning:** {reason}")
-                    
-                    # Python Calculates SL/TP (NO LLM HALLUCINATION)
-                    if decision in ["BUY", "SELL"]:
-                        st.subheader("🎯 Trade Setup (Math Based)")
-                        
-                        entry = data['price']
-                        atr = data['atr']
-                        
-                        if decision == "BUY":
-                            sl = entry - (2 * atr)
-                            tp1 = entry + (2 * atr)
-                            tp2 = entry + (4 * atr)
-                        else: # SELL
-                            sl = entry + (2 * atr)
-                            tp1 = entry - (2 * atr)
-                            tp2 = entry - (4 * atr)
-                            
-                        t1, t2, t3, t4 = st.columns(4)
+                        t1,t2,t3,t4 = st.columns(4)
                         t1.metric("Entry", f"${entry:,.4f}")
                         t2.metric("Stop Loss", f"${sl:,.4f}")
-                        t3.metric("Take Profit 1", f"${tp1:,.4f}")
-                        t4.metric("Take Profit 2", f"${tp2:,.4f}")
-                        
-                        st.caption("SL and TP are calculated using ATR (Average True Range). The AI only provided the direction.")
-                        
+                        t3.metric("TP1", f"${tp1:,.4f}")
+                        t4.metric("TP2", f"${tp2:,.4f}")
                 except Exception as e:
                     st.error(f"LLM Error: {e}")
